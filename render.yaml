@@ -34,8 +34,3 @@ services:
           name: pyne-api
           type: web
           property: host
-EOF
-
-git add render.yaml
-git commit -m "Add Render blueprint"
-git push origin main
