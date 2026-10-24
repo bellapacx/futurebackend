@@ -1,5 +1,3 @@
-cd ~/futures-charting
-cat > render.yaml <<'EOF'
 services:
   - type: web
     name: pyne-api
