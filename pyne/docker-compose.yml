@@ -1,0 +1,158 @@
+# Copyright (C) 2024-2026 jango_blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Local development stack for the PYNE Pro API + CLI.
+#
+#   docker compose up --build api
+#   PYNE_RUNNER=1 PYNE_RUNNER_SCHEDULER=1 docker compose up --build api
+#   docker compose --profile redis up --build
+#   docker compose --profile lsp run --rm lsp
+#   docker compose --profile cli run --rm cli check script.pine
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+#
+# Host port defaults to 5002 (AXIS / local docs expect the API there).
+
+name: pynescript
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api-dev
+      args:
+        PYNESCRIPT_VERSION: ${PYNESCRIPT_VERSION:-0.6.7}
+        GIT_SHA: ${GIT_SHA:-dev}
+    image: pynescript-api:dev
+    ports:
+      - "${API_PORT:-5002}:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      FLASK_ENV: development
+      FLASK_DEBUG: "${FLASK_DEBUG:-1}"
+      API_KEY_STORE: /data/api_keys.json
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://hoox.sh,https://hoox.sh/axis,http://localhost:8081,http://127.0.0.1:8081}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      # Explicit REDIS_URL wins (e.g. Memorystore, or the passworded local
+      # form redis://:PASSWORD@redis:6379/0 matching REDIS_PASSWORD above).
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      PYTHONPATH: /app/src:/app
+      # Optional hosted runner (script registry + bar-close). Off by default.
+      PYNE_RUNNER: ${PYNE_RUNNER:-0}
+      PYNE_RUNNER_SCHEDULER: ${PYNE_RUNNER_SCHEDULER:-0}
+      PYNE_RUNNER_POLL_SECONDS: ${PYNE_RUNNER_POLL_SECONDS:-60}
+      PYNE_RUNNER_DB: /data/runner.db
+    volumes:
+      - ./src:/app/src:ro
+      - ./backend:/app/backend:ro
+      - api_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - pynescript
+    # When the redis profile is active, wait for it; otherwise ignore.
+    depends_on:
+      redis:
+        condition: service_healthy
+        required: false
+
+  redis:
+    image: redis:7-alpine
+    profiles:
+      - redis
+    # No published ports: the key store must never be reachable from the
+    # internet (an exposed Redis is wiped within hours — FLUSHALL + cron
+    # miner payloads). The API reaches it over the internal network.
+    # Set REDIS_PASSWORD (and the matching REDIS_URL below) for auth.
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-}"]
+    healthcheck:
+      # Plain ping first (no password set), then authenticated (password set).
+      test: ["CMD-SHELL", "redis-cli ping 2>/dev/null || redis-cli -a $${REDIS_PASSWORD} ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - pynescript
+
+  lsp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: lsp
+      args:
+        PYNESCRIPT_VERSION: ${PYNESCRIPT_VERSION:-0.6.7}
+        GIT_SHA: ${GIT_SHA:-dev}
+    image: pynescript-lsp:latest
+    profiles:
+      - lsp
+    environment:
+      PYTHONPATH: /app/src
+    volumes:
+      - ./src:/app/src:ro
+    # stdio language server — use `docker compose run --rm -i lsp` for interactive
+    stdin_open: true
+    tty: false
+    networks:
+      - pynescript
+
+  # Ephemeral CLI — `docker compose --profile cli run --rm cli check script.pine`
+  # No ports, no env_file (avoids leaking host .env secrets), no privileged.
+  # No healthcheck: process is a one-shot Click command, not a daemon.
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cli
+      args:
+        PYNESCRIPT_VERSION: ${PYNESCRIPT_VERSION:-0.6.7}
+        GIT_SHA: ${GIT_SHA:-dev}
+    image: pynescript-cli:latest
+    profiles:
+      - cli
+    user: "1000:1000"
+    working_dir: /work
+    environment:
+      PYTHONPATH: /app/src
+      PYNE_COMPILE_DISK_CACHE: "1"
+      PYNE_COMPILE_CACHE_DIR: /data/compile-cache
+      XDG_CACHE_HOME: /data/cache
+    volumes:
+      # Package sources read-only (prefer over site-packages via PYTHONPATH)
+      - ./src:/app/src:ro
+      # Workspace for .pine inputs/outputs (host CWD). Keep rw for format/write.
+      - .:/work
+      # Persistent IR / Numba disk cache across runs
+      - cli_data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Ephemeral — do not restart; use `compose run --rm`
+    restart: "no"
+    networks:
+      - pynescript
+
+volumes:
+  api_data:
+  redis_data:
+  cli_data:
+
+networks:
+  pynescript:
+    name: pynescript-dev

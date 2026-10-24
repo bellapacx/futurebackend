@@ -1,0 +1,592 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"  # e.g., v1.0.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g., 1.0.0)"
+        required: true
+        type: string
+
+# Least privilege by default; release job elevates contents: write only.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Nuitka 2.0.x supports up to 3.11; 3.12 needs a newer Nuitka pin.
+  PYTHON_VERSION: "3.11"
+  NUITKA_JOBS: 4
+
+jobs:
+  build-package:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install build twine
+          python -m build
+          twine check dist/*
+          # Guard against empty/misnamed dist (hard fail before release staging).
+          ls -la dist/
+          test -n "$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | head -1)"
+
+      - name: Smoke-import wheel (CLI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/pynescript-wheel
+          /tmp/pynescript-wheel/bin/pip install dist/*.whl
+          /tmp/pynescript-wheel/bin/python -c "import pynescript; print('version', pynescript.__version__)"
+          /tmp/pynescript-wheel/bin/pynescript --help
+          /tmp/pynescript-wheel/bin/pynescript info
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: hoox-pyne-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-lsp:
+    name: Build LSP Binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Partial platform success still feeds the release job (package+vscode required).
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: pynescript-lsp-linux-x86_64
+          - os: windows-latest
+            artifact_name: pynescript-lsp-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: pynescript-lsp-macos-arm64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # LSP-only (no numba/compiler) — smaller Nuitka graph, avoids broken macOS
+          # cryptography/llvmlite packaging for an editor binary that only needs parse+lint.
+          python -m pip install -e ".[lsp]"
+          python -m pip install "nuitka>=2.5.1,<2.8" cryptography
+
+      - name: Build metadata & encrypt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build/compile.py --target lsp --no-encrypt --check
+        env:
+          CRYPTO_KEY: ${{ secrets.METADATA_KEY }}
+
+      - name: Build onefile binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build/ci_build.py --target lsp --jobs ${{ env.NUITKA_JOBS }}
+        env:
+          CRYPTO_KEY: ${{ secrets.METADATA_KEY }}
+
+      - name: Find binary and rename to platform artifact name
+        id: find_binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY=$(find dist -name "pynescript-lsp*" -type f \( -perm -111 -o -name "*.exe" \) 2>/dev/null | head -1 || true)
+          if [ -z "${BINARY:-}" ]; then
+            BINARY=$(find dist -name "pynescript-lsp*" -type f | head -1 || true)
+          fi
+          if [ -z "${BINARY:-}" ] || [ ! -f "$BINARY" ]; then
+            echo "No pynescript-lsp binary under dist/" >&2
+            ls -laR dist || true
+            exit 1
+          fi
+          # Always ship under a unique platform name so GitHub Release assets
+          # do not collide (all platforms otherwise produce "pynescript-lsp").
+          DEST="dist/${{ matrix.artifact_name }}"
+          mkdir -p dist
+          cp -f "$BINARY" "$DEST"
+          chmod +x "$DEST" 2>/dev/null || true
+          echo "binary=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Found: $BINARY -> $DEST ($(wc -c < "$DEST") bytes)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ steps.find_binary.outputs.binary }}
+          if-no-files-found: error
+          retention-days: 5
+
+  build-cli:
+    name: Build CLI Binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: pynescript-cli-linux-x86_64
+          - os: windows-latest
+            artifact_name: pynescript-cli-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: pynescript-cli-macos-arm64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # Core package only — CLI Nuitka graph excludes numba/LSP/Flask.
+          python -m pip install -e .
+          python -m pip install "nuitka>=2.5.1,<2.8" cryptography
+
+      - name: Import check
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          python scripts/build/compile.py --target cli --check
+
+      - name: Build onefile binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build/ci_build.py --target cli --jobs ${{ env.NUITKA_JOBS }} --skip-metadata --skip-vsix
+
+      - name: Find binary and rename to platform artifact name
+        id: find_binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prefer exact CLI paths from ci_build; never match pynescript-lsp*.
+          BINARY=""
+          for cand in \
+            dist/pynescript.exe \
+            dist/pynescript \
+            dist/cli/pynescript.exe \
+            dist/cli/pynescript
+          do
+            if [ -f "$cand" ] && [[ "$(basename "$cand")" != pynescript-lsp* ]]; then
+              BINARY="$cand"
+              break
+            fi
+          done
+          if [ -z "${BINARY:-}" ]; then
+            # Exact basenames only — never pynescript-lsp* (portable; no process substitution).
+            BINARY=$(
+              find dist -type f \( \
+                -name 'pynescript' -o \
+                -name 'pynescript.exe' -o \
+                -name 'pynescript.bin' -o \
+                -name 'pynescript.onefile.exe' \
+              \) 2>/dev/null | head -1 || true
+            )
+          fi
+          if [ -z "${BINARY:-}" ] || [ ! -f "$BINARY" ]; then
+            echo "No pynescript CLI binary under dist/" >&2
+            ls -laR dist || true
+            exit 1
+          fi
+          # Defensive: never ship the LSP binary as the CLI artifact.
+          base=$(basename "$BINARY")
+          if [[ "$base" == pynescript-lsp* ]] || [[ "$base" == *lsp* ]]; then
+            echo "Refusing to stage LSP binary as CLI: $BINARY" >&2
+            exit 1
+          fi
+          DEST="dist/${{ matrix.artifact_name }}"
+          mkdir -p dist
+          cp -f "$BINARY" "$DEST"
+          chmod +x "$DEST" 2>/dev/null || true
+          echo "binary=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Found: $BINARY -> $DEST ($(wc -c < "$DEST") bytes)"
+
+      - name: Smoke CLI binary
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.find_binary.outputs.binary }}"
+          test -f "$BIN"
+          # Windows runners use bash; onefile may need a moment to unpack.
+          if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+            "$BIN" --help
+            # info is best-effort on Windows (path/console quirks); help is the gate.
+            "$BIN" info || echo "warning: CLI info soft-failed on Windows" >&2
+          else
+            chmod +x "$BIN"
+            "$BIN" --help
+            "$BIN" info || echo "warning: CLI info soft-failed" >&2
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ steps.find_binary.outputs.binary }}
+          if-no-files-found: error
+          retention-days: 5
+
+  build-vscode:
+    name: Build VS Code Extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Install dependencies
+        working-directory: vscode-extension
+        run: npm ci
+
+      - name: Compile TypeScript
+        working-directory: vscode-extension
+        run: npm run compile
+
+      - name: Package extension
+        working-directory: vscode-extension
+        run: |
+          set -euo pipefail
+          VER=$(node -p "require('./package.json').version")
+          npx --yes @vscode/vsce package --no-dependencies --no-git-tag-version \
+            --out "pyne-vscode-${VER}.vsix"
+          ls -lh "pyne-vscode-${VER}.vsix"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pynescript-vscode-extension
+          path: vscode-extension/pyne-vscode-*.vsix
+          if-no-files-found: error
+          retention-days: 5
+
+  build-docker-cli:
+    name: Build CLI Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            VER=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/pynescript/__about__.py)
+            test -n "$VER"
+            echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build CLI image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: cli
+          push: false
+          load: true
+          # Avoid attestations that bloat / confuse local docker save.
+          provenance: false
+          sbom: false
+          tags: |
+            pynescript-cli:${{ steps.version.outputs.version }}
+            pynescript-cli:latest
+          build-args: |
+            PYNESCRIPT_VERSION=${{ steps.version.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke CLI container
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read-only root FS where possible; no network needed for --help/info/check.
+          docker run --rm --network=none pynescript-cli:latest --help
+          docker run --rm --network=none pynescript-cli:latest info
+          # Image runs as uid 1000 (appuser). mktemp is 0700 — open for non-root reads.
+          TMP=$(mktemp -d)
+          chmod 755 "$TMP"
+          printf '%s\n' '//@version=5' 'indicator("ci")' 'plot(close)' > "$TMP/smoke.pine"
+          chmod 644 "$TMP/smoke.pine"
+          docker run --rm --network=none \
+            -v "$TMP:/work:ro" -w /work \
+            pynescript-cli:latest check smoke.pine -q
+
+      - name: Save image tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Single tag only — do not docker save every intermediate layer ref.
+          docker save pynescript-cli:latest | gzip -9 > pynescript-cli-image.tar.gz
+          ls -lh pynescript-cli-image.tar.gz
+          # Fail if tarball is suspiciously tiny (empty/corrupt save).
+          test "$(stat -c%s pynescript-cli-image.tar.gz)" -gt 1000000
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pynescript-cli-docker
+          path: pynescript-cli-image.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  release:
+    name: Create Release
+    needs: [build-package, build-lsp, build-cli, build-vscode, build-docker-cli]
+    runs-on: ubuntu-latest
+    # Ship package+vscode always; platform binaries / docker attach when present
+    # (matrix fail-fast: false). Never create a tag release if package failed.
+    if: >
+      always() &&
+      (
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+        github.event_name == 'workflow_dispatch'
+      ) &&
+      needs.build-package.result == 'success' &&
+      needs.build-vscode.result == 'success'
+    permissions:
+      contents: write
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download package + binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          # Exclude buildx cache blobs (hoox-sh~pyne~*.dockerbuild) that
+          # aborted Create Release on v0.3.7 when downloading everything.
+          pattern: "pynescript-*"
+          merge-multiple: false
+
+      - name: Download PyPI dist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: hoox-pyne-dist
+          path: artifacts/hoox-pyne-dist
+
+      - name: Stage release files with stable names
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          staged=0
+          binaries=0
+
+          stage_file() {
+            local src="$1"
+            local dest_name="$2"
+            cp -f "$src" "release-assets/$dest_name"
+            staged=$((staged + 1))
+            echo "staged $dest_name ($(wc -c < "release-assets/$dest_name") bytes)"
+          }
+
+          # PyPI sdist + wheel (required — package job is a hard dependency).
+          if [ ! -d artifacts/hoox-pyne-dist ]; then
+            echo "ERROR: missing hoox-pyne-dist artifact (package job must succeed)" >&2
+            ls -laR artifacts || true
+            exit 1
+          fi
+          for f in artifacts/hoox-pyne-dist/*; do
+            [ -f "$f" ] || continue
+            stage_file "$f" "$(basename "$f")"
+          done
+          if ! find release-assets -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | grep -q .; then
+            echo "ERROR: no wheel/sdist staged — refusing empty/incomplete release" >&2
+            ls -la release-assets/ || true
+            exit 1
+          fi
+
+          # Platform binaries (already renamed at upload time). Optional per matrix cell.
+          for name in \
+            pynescript-lsp-linux-x86_64 \
+            pynescript-lsp-windows-x86_64.exe \
+            pynescript-lsp-macos-arm64 \
+            pynescript-cli-linux-x86_64 \
+            pynescript-cli-windows-x86_64.exe \
+            pynescript-cli-macos-arm64
+          do
+            if [ -d "artifacts/$name" ]; then
+              f=$(find "artifacts/$name" -type f | head -1 || true)
+              if [ -n "${f:-}" ] && [ -f "$f" ]; then
+                stage_file "$f" "$name"
+                binaries=$((binaries + 1))
+              fi
+            else
+              echo "note: artifact $name not present (matrix cell skipped/failed)"
+            fi
+          done
+
+          # VSIX — prefer pyne-*.vsix, skip tiny junk.
+          if [ ! -d artifacts/pynescript-vscode-extension ]; then
+            echo "ERROR: missing pynescript-vscode-extension artifact" >&2
+            exit 1
+          fi
+          vsix=$(find artifacts/pynescript-vscode-extension -name 'pyne-vscode-*.vsix' -type f | head -1 || true)
+          if [ -z "${vsix:-}" ]; then
+            vsix=$(find artifacts/pynescript-vscode-extension -name 'pyne-*.vsix' -type f | head -1 || true)
+          fi
+          if [ -z "${vsix:-}" ]; then
+            vsix=$(find artifacts/pynescript-vscode-extension -name '*.vsix' -type f -size +50k | head -1 || true)
+          fi
+          if [ -z "${vsix:-}" ]; then
+            echo "ERROR: no .vsix found in vscode extension artifact" >&2
+            ls -laR artifacts/pynescript-vscode-extension || true
+            exit 1
+          fi
+          stage_file "$vsix" "$(basename "$vsix")"
+
+          # CLI Docker image tarball (optional — docker job may fail independently).
+          if [ -d artifacts/pynescript-cli-docker ]; then
+            img=$(find artifacts/pynescript-cli-docker -name 'pynescript-cli-image.tar.gz' -type f | head -1 || true)
+            if [ -n "${img:-}" ]; then
+              stage_file "$img" "pynescript-cli-image.tar.gz"
+            fi
+          else
+            echo "note: pynescript-cli-docker artifact not present"
+          fi
+
+          ls -la release-assets/
+          echo "staged_count=$staged" >> "$GITHUB_OUTPUT"
+          echo "binary_count=$binaries" >> "$GITHUB_OUTPUT"
+
+          if [ "$staged" -lt 2 ]; then
+            echo "ERROR: too few release assets ($staged) — refusing silent empty release" >&2
+            exit 1
+          fi
+          if [ "$binaries" -eq 0 ]; then
+            # Soft: package + VSIX still constitute a useful release; Nuitka matrices can flake.
+            echo "warning: no CLI/LSP platform binaries staged; release will be package+VSIX(+docker) only" >&2
+          fi
+
+      - name: Extract CHANGELOG.md for release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/changelog_release_notes.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --changelog CHANGELOG.md \
+            --out release-notes.md
+          test -s release-notes.md
+          head -c 400 release-notes.md
+
+      - name: Create release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
+          name: "pyne v${{ steps.version.outputs.version }}"
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          # Staging step only copies files that exist; glob must match at least one.
+          fail_on_unmatched_files: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-vscode:
+    name: Publish to VS Code Marketplace
+    needs: [build-vscode]
+    runs-on: ubuntu-latest
+    if: >
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download VSIX
+        uses: actions/download-artifact@v8
+        with:
+          name: pynescript-vscode-extension
+          path: .
+
+      - name: Publish to Marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VSIX=$(ls pyne-vscode-*.vsix 2>/dev/null | head -1 || true)
+          if [ -z "${VSIX:-}" ]; then
+            VSIX=$(ls *.vsix 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "${VSIX:-}" ]; then
+            echo "No VSIX artifact to publish" >&2
+            exit 1
+          fi
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "VSCE_PAT not set — skipping Marketplace publish (VSIX still on GitHub Release)."
+          else
+            npx --yes @vscode/vsce publish --pat "$VSCE_PAT" --packagePath "$VSIX"
+          fi
+          if [ -z "${OVSX_PAT:-}" ]; then
+            echo "OVSX_PAT not set — skipping Open VSX (optional extra package)."
+          elif ! npx --yes ovsx publish "$VSIX" -p "$OVSX_PAT"; then
+            # Namespace must exist on Open VSX (publisher in package.json).
+            # Do not fail the release: VSIX is already on the GitHub Release.
+            echo "Open VSX publish failed (unknown publisher or other). VSIX remains on GitHub Release."
+          fi

@@ -1,0 +1,5 @@
+// Parity fixture: entry long then close
+// Same-bar entry+close can repeat each bar (flat after close).
+//@version=5
+strategy.entry("L", strategy.long, qty=10)
+strategy.close("L", qty=10)

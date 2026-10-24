@@ -1,0 +1,127 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+title: "Semantic Tokens"
+description: "textDocument/semanticTokens/full and /range — AST visitor, custom legend, and LSP delta encoding."
+---
+
+# Semantic Tokens
+
+## Abstract
+
+Semantic tokens let the server paint identifiers with roles richer than TextMate scopes (library namespaces vs user variables, function defs vs properties). PYNE advertises a **full and range** semantic-tokens provider with a **short custom legend** (not the full LSP standard set). `textDocument/semanticTokens/full` walks the workspace AST; `textDocument/semanticTokens/range` clips the same legend to tokens whose start falls inside the requested range.
+
+## Conceptual model
+
+```mermaid
+flowchart LR
+  REQ["semanticTokens/full or /range"] --> AST{cached tree?}
+  AST -->|missing source / parse fail| EMPTY[SemanticTokens data=[]]
+  AST -->|ok| WALK[_collect FunctionDef TypeDef EnumDef Assign Attribute]
+  WALK --> SORT[sort by line, col]
+  SORT --> CLIP{range request?}
+  CLIP -->|yes| KEEP[keep starts in range]
+  CLIP -->|no| ENC
+  KEEP --> ENC["delta encode: dLine, dCol, len, type, mods"]
+```
+
+## Interface surface
+
+Capability (`config.py` → `semantic_tokens_provider`):
+
+```text
+legend.token_types (index order is contract):
+  namespace, type, class, function, method, variable,
+  parameter, property, keyword, string, number, operator, comment
+
+legend.token_modifiers (bit 0 = declaration):
+  declaration, definition, readonly, defaultLibrary
+
+range: true
+full: true
+```
+
+| Method | Handler |
+| --- | --- |
+| `textDocument/semanticTokens/full` | `handle_semantic_tokens` |
+| `textDocument/semanticTokens/range` | `handle_semantic_tokens_range` |
+
+Both take `(params, source, tree=…)` and return `lsp.SemanticTokens(data=[...])` — LSP-encoded five-tuples as a flat `int` array (relative line/character deltas). Range uses the **same legend** as full: collect, sort, then keep tokens whose start `(line, col)` is in `params.range` (inclusive start, exclusive end) before encoding.
+
+### What is emitted
+
+| AST | Token type | Modifiers |
+| --- | --- | --- |
+| `FunctionDef.name` | function | definition \| declaration |
+| `TypeDef.name` | class | definition \| declaration |
+| `EnumDef.name` | type | definition \| declaration |
+| `Assign` to `Name` | variable | declaration |
+| `Attribute` whose value is a builtin namespace (`ta`, `math`, `strategy`, …) | namespace + method | defaultLibrary (+ readonly on ns) |
+| Other `Attribute.attr` | property | — |
+
+Builtin namespace set (`_BUILTIN_NS`): `ta`, `math`, `str`, `array`, `matrix`, `map`, `strategy`, `request`, `input`, `color`, `line`, `label`, `box`, `table`, `polyline`, `log`, `ticker`, `timeframe`, `chart`, `runtime`, `syminfo`, `barstate`, `session`, `time`.
+
+## Internals
+
+| Path | Role |
+| --- | --- |
+| `features/semantic_tokens.py` | Collector + `_encode` + range clip |
+| `config.py` | Legend + capability — **indices must match** `_TT` |
+| `server.py` | `TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL` / `_RANGE`; passes cached `doc.ast` |
+
+Attribute columns prefer `end_col_offset - len(attr)` when present; otherwise parent `col_offset` (approximate).
+
+TextMate from `vscode-extension/syntaxes/pinescript.tmLanguage.json` still colors keywords, strings, and comments — the visitor does not emit those yet even though the legend reserves the slots.
+
+## Invariants and edge cases
+
+1. **Never throws** — missing source, `tree=None`, or parse exception yields empty `data`.
+2. **Range is a clip of full** — same types/modifiers; tokens whose start is outside the range are dropped. A range token stream is a subsequence of the full stream.
+3. **Legend is fixed** at initialize; changing indices later would break cached clients.
+4. Empty `data` is valid protocol (empty file, parse failure, or no tokens in range), not an error.
+5. Tokens are sorted by `(line, col)` before delta encoding.
+
+## Worked example
+
+```pinescript
+//@version=6
+indicator("tok")
+length = 14
+plot(ta.sma(close, length))
+```
+
+Full document: tokens for `length` (variable/declaration), `ta` (namespace/defaultLibrary), `sma` (method/defaultLibrary). Keywords such as `indicator` remain TextMate-only.
+
+Range covering only the `plot(ta.sma…)` line keeps `ta` / `sma` (and any other starts on that line) and drops the `length` assignment. A range covering only the `//@version=6` pragma yields no namespace token.
+
+## Failure modes
+
+| Symptom | Cause |
+| --- | --- |
+| Semantic highlighting off despite tokens | Client `editor.semanticHighlighting.enabled` false |
+| Colors look “shifted” after a legend edit | Client cached old type indices — restart the language client |
+| Range request returns empty `data` | Parse failure, empty buffer, or no token starts in range — not a capability miss |
+| Attribute token sits on the wrong column | Missing `end_col_offset` on the AST node — approximate path |
+
+## See also
+
+- [VS Code extension](/pyne/docs/lsp/vscode-extension) — TextMate grammar
+- [Architecture](/pyne/docs/lsp/architecture)
+- [Inlay hints](/pyne/docs/lsp/features/inlay-hints) — complementary visual annotations

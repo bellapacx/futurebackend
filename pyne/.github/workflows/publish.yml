@@ -1,0 +1,130 @@
+# Publish hoox-pyne (import: pynescript) to PyPI on version tags (v*).
+#
+# PyPI ownership: personal account **jango-blockchained** (not a PyPI org).
+# GitHub Actions still run on **hoox-sh/pyne** (where the workflow lives).
+#
+# Preferred auth (personal account, no org approval needed):
+#   1. pypi.org → Account settings → API tokens → "Add API token"
+#        Scope: Entire account (first upload) or Project: hoox-pyne (after exists)
+#   2. gh secret set PYPI_API_TOKEN -R hoox-sh/pyne
+#   3. GitHub environment "pypi" on hoox-sh/pyne (optional protection rules)
+#
+# Optional Trusted Publishing (OIDC, no long-lived token):
+#   1. Log into PyPI as jango-blockchained → Publishing → Add pending publisher
+#        Project: hoox-pyne
+#        Owner: hoox-sh          ← GitHub *repo* owner (workflow host)
+#        Repository: pyne
+#        Workflow: publish.yml
+#        Environment: pypi
+#   2. Leave PYPI_API_TOKEN unset so the publish job uses OIDC
+#
+# Notes:
+#   - PyPI "pynescript" = elbakramer; "pyne"/"PyNE" = unrelated 0.1.0 lib.
+#     This project ships as **hoox-pyne** (import/CLIs stay pynescript).
+#   - GitHub Owner in the Trusted Publisher form is *not* the PyPI username.
+#
+# Usage:
+#   git tag v0.3.0 && git push origin v0.3.0
+#   # or: Actions → Publish → Run workflow (dry_run=false to upload)
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check only (skip PyPI upload)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist + wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install build twine
+          python -m build
+          twine check dist/*
+          test -n "$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | head -1)"
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: hoox-pyne-release-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 5
+
+  publish-pypi:
+    name: Upload to PyPI
+    needs: [build]
+    runs-on: ubuntu-latest
+    # Skip dry-run dispatches; always publish on real version tags.
+    if: >
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hoox-pyne/
+    permissions:
+      id-token: write  # Trusted Publishing (OIDC) when no API token secret
+      contents: read
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v8
+        with:
+          name: hoox-pyne-release-dist
+          path: dist
+
+      - name: Resolve publish auth mode
+        id: auth
+        shell: bash
+        env:
+          # Non-empty when the secret is configured (never print the value).
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PYPI_API_TOKEN:-}" ]; then
+            echo "mode=token" >> "$GITHUB_OUTPUT"
+            echo "Using personal PyPI API token (jango-blockchained account scope)."
+          else
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+            echo "No PYPI_API_TOKEN secret — using Trusted Publishing (OIDC)."
+          fi
+
+      - name: Publish package (API token)
+        if: steps.auth.outputs.mode == 'token'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          # Re-running the same tag (or a duplicate push) must not 400.
+          skip-existing: true
+
+      - name: Publish package (Trusted Publishing OIDC)
+        if: steps.auth.outputs.mode == 'oidc'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
+          # skip-existing is incompatible with PEP 740 attestations.
+          attestations: false

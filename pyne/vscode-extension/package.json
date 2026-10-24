@@ -1,0 +1,233 @@
+{
+  "name": "pyne",
+  "displayName": "PYNE Language Support",
+  "description": "Syntax highlighting, diagnostics, autocomplete, hover, and formatting for .pyne / .pine sources. Powered by hoox-pyne. Part of the HOOX open trading stack. Unofficial — not affiliated with TradingView, Inc.",
+  "version": "0.4.4",
+  "publisher": "hoox-sh",
+  "license": "AGPL-3.0-or-later",
+  "author": {
+    "name": "jango_blockchained",
+    "url": "https://hoox.sh"
+  },
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#050505",
+    "theme": "dark"
+  },
+  "homepage": "https://hoox.sh/pyne",
+  "qna": "https://github.com/hoox-sh/pyne/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hoox-sh/pyne.git",
+    "directory": "vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/hoox-sh/pyne/issues"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters",
+    "Other"
+  ],
+  "keywords": [
+    "pinescript",
+    "pine script",
+    "pine",
+    "tradingview",
+    "pyne",
+    "pynescript",
+    "hoox",
+    "axis",
+    "lsp",
+    "language server",
+    "trading",
+    "indicators",
+    "strategy"
+  ],
+  "activationEvents": [
+    "onLanguage:pinescript",
+    "onCommand:pynescript.restartServer",
+    "onCommand:pynescript.formatDocument",
+    "onCommand:pynescript.showLspOutput",
+    "onCommand:pynescript.showLspCommand",
+    "onCommand:pynescript.convertToV6",
+    "workspaceContains:**/*.pyne",
+    "workspaceContains:**/*.pine",
+    "workspaceContains:**/*.pinev5",
+    "workspaceContains:**/*.pinev6"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "pinescript",
+        "aliases": [
+          "PYNE",
+          "pyne",
+          "pinescript",
+          "Pine"
+        ],
+        "extensions": [
+          ".pyne",
+          ".pine",
+          ".pinev5",
+          ".pinev6",
+          ".pinescript"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./media/icon.png",
+          "dark": "./media/icon.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "pinescript",
+        "scopeName": "source.pinescript",
+        "path": "./syntaxes/pinescript.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[pinescript]": {
+        "editor.semanticHighlighting.enabled": true,
+        "editor.bracketPairColorization.enabled": true,
+        "editor.guides.bracketPairs": "active",
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.wordBasedSuggestions": "off",
+        "editor.defaultFormatter": "hoox-sh.pyne",
+        "files.insertFinalNewline": true
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "title": "PYNE",
+      "properties": {
+        "pynescript.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the PYNE language server (completion, hover, diagnostics, symbols)."
+        },
+        "pynescript.lsp.command": {
+          "type": "string",
+          "default": "auto",
+          "description": "LSP launch command. Use \"auto\" to try pyne-lsp (then pynescript-lsp) on PATH, then python -m pynescript.langserver. Or set an absolute path, or \"docker\" with lsp.args for ghcr.io/hoox-sh/pyne/lsp. ${workspaceFolder} is expanded."
+        },
+        "pynescript.lsp.python": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter used when lsp.command is auto and neither pyne-lsp nor pynescript-lsp is on PATH (must have: pip install \"hoox-pyne[lsp]\")."
+        },
+        "pynescript.lsp.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra arguments passed to the language server process."
+        },
+        "pynescript.formatting.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable formatting support (when the server supports it)."
+        },
+        "pynescript.diagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostic squiggles from the language server."
+        },
+        "pynescript.completion.snippets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable snippet completions for builtin functions."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "pynescript.restartServer",
+        "title": "Restart Language Server",
+        "category": "PYNE"
+      },
+      {
+        "command": "pynescript.formatDocument",
+        "title": "Format Document",
+        "category": "PYNE"
+      },
+      {
+        "command": "pynescript.showLspOutput",
+        "title": "Show Language Server Output",
+        "category": "PYNE"
+      },
+      {
+        "command": "pynescript.showLspCommand",
+        "title": "Show Resolved LSP Launch Command",
+        "category": "PYNE"
+      },
+      {
+        "command": "pynescript.convertToV6",
+        "title": "Convert to Pine v6",
+        "category": "PYNE"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "pynescript.restartServer"
+        },
+        {
+          "command": "pynescript.formatDocument",
+          "when": "editorLangId == pinescript"
+        },
+        {
+          "command": "pynescript.showLspOutput"
+        },
+        {
+          "command": "pynescript.showLspCommand"
+        },
+        {
+          "command": "pynescript.convertToV6",
+          "when": "editorLangId == pinescript"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "pynescript.formatDocument",
+          "when": "editorLangId == pinescript",
+          "group": "1_modification@10"
+        },
+        {
+          "command": "pynescript.convertToV6",
+          "when": "editorLangId == pinescript",
+          "group": "1_modification@11"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "node esbuild.mjs",
+    "compile:tsc": "tsc -p ./ --noEmit",
+    "watch": "node esbuild.mjs --watch",
+    "package": "npm run compile && node -e \"const v=require('./package.json').version; require('child_process').execSync('npx --yes @vscode/vsce package --no-dependencies --no-git-tag-version --out pyne-vscode-'+v+'.vsix',{stdio:'inherit'})\"",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@types/vscode": "1.91.0",
+    "@vscode/test-electron": "^3.1.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.1"
+  },
+  "overrides": {
+    "brace-expansion": "^5.0.12"
+  }
+}

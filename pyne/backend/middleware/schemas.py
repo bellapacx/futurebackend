@@ -1,0 +1,354 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Request body schema validation for the Pynescript Pro API.
+
+Audit 2026-07-05 / S9: every ``request.get_json()`` is validated against an
+explicit schema. Unknown fields are rejected (no silent type coercion).
+The validator is hand-rolled (no pydantic/marshmallow dependency) because
+the API surface is small (~6 endpoints) and the existing patterns are
+simple.
+
+A schema is a dict mapping field name → ``(type, required, default)``. The
+``_validate`` helper returns either the validated dict or a Flask response
+tuple for invalid input. Endpoints can do::
+
+    data, err = validate(request.get_json() or {}, REQUIRED_SCRIPT_FIELD)
+    if err:
+        return err
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from flask import jsonify
+
+
+def _expect_str(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _expect_list(value: Any) -> list | None:
+    return value if isinstance(value, list) else None
+
+
+def _expect_dict(value: Any) -> dict | None:
+    return value if isinstance(value, dict) else None
+
+
+# Schema for the free /run endpoint. Pine script source + OHLCV bar data.
+# We keep the bar-list check loose (length >= 1, no per-bar schema) to match
+# existing behaviour; tightening that is its own audit item.
+RUN_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "script": (str, True, ""),
+    "data": (list, True, []),
+    # Optional request.* data source wiring
+    "symbol": (str, False, "CHART"),
+    "data_source": (str, False, ""),  # ""|mock|ccxt|ccxtpro|yahoo|alphavantage
+    "data_options": (dict, False, {}),  # exchange, api_key, seed, start_price, …
+    "mode": (str, False, "auto"),  # interpret|compile|auto (default auto = compile+fallback)
+    # Pine input.* overrides keyed by title (AXIS Script Settings)
+    "inputs": (dict, False, {}),
+    # When true, interpret path collects per-line ms/execs for AXIS profiler gutter
+    "profiler": (bool, False, False),
+    # L2 alert webhooks (also: env ALERT_WEBHOOK_URL)
+    "webhook_url": (str, False, ""),
+    "forward_alerts": (bool, False, True),
+    "alert_last_bar": (bool, False, True),  # only POST firings on last OHLCV bar
+    "alert_batch": (bool, False, True),  # one batch POST vs per-alert
+    # AXIS git publish emulator: [{namespace, name, version, source}, …]
+    "libraries": (list, False, []),
+    # Optional interpret wall-clock budget; omit / null → None (no timeout).
+    "timeout_seconds": (float, False, None),
+    # Response windowing (inclusive bar indices into `data`, negative = from
+    # end). Trims the *envelope* only — the bar loop still sees every bar, so
+    # evaluation and Pine parity are unchanged. Omit both for today's behaviour.
+    "from_bar": (int, False, None),
+    "to_bar": (int, False, None),
+}
+
+# ── Live evaluation sessions ────────────────────────────────────────────────
+# Kept in-process by design (see backend/middleware/sessions.py); the Pro API
+# therefore runs a single gunicorn worker.
+
+SESSION_CREATE_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "script": (str, True, ""),
+    "data": (list, True, []),
+    "symbol": (str, False, "CHART"),
+    "inputs": (dict, False, {}),
+    "profiler": (bool, False, False),
+    "libraries": (list, False, []),
+    # Interpret only — compile has no resumable evaluator state. Accepted so
+    # the rejection is an explicit 400 rather than a schema error.
+    "mode": (str, False, "interpret"),
+}
+
+SESSION_TICK_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    # 'bar' is validated structurally by the route (OHLCV object).
+    "bar": (dict, True, {}),
+    # Optional envelope trim, same semantics as POST /run.
+    "from_bar": (int, False, None),
+    "to_bar": (int, False, None),
+    # Delta response: only the re-ticked tail cell instead of full series.
+    "delta": (bool, False, False),
+}
+
+SESSION_APPEND_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "bars": (list, True, []),
+    "realtime_ticks": (int, False, 1),
+    "from_bar": (int, False, None),
+    "to_bar": (int, False, None),
+    # Delta response: only the appended tail instead of full series.
+    "delta": (bool, False, False),
+}
+
+# ── Engine-owned OHLCV data plane (/data/*) ─────────────────────────────────
+# Series identity is canonicalized in backend/datastore/series.py; ``symbol`` is
+# also the display name for a data session.
+
+DATA_SERIES_KEY_FIELDS: dict[str, tuple[type, bool, Any]] = {
+    "exchange": (str, True, ""),
+    "market": (str, False, "spot"),  # spot | swap | future
+    "symbol": (str, True, ""),
+    "interval": (str, True, ""),
+}
+
+DATA_SERIES_PROVIDE_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    **DATA_SERIES_KEY_FIELDS,
+    "bars": (list, True, []),
+    "source": (str, False, "axis-local"),
+}
+
+DATA_SERIES_FETCH_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    **DATA_SERIES_KEY_FIELDS,
+    "history_bars": (int, False, 5000),
+}
+
+DATA_SESSION_CREATE_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    **DATA_SERIES_KEY_FIELDS,
+    "history_bars": (int, False, 5000),
+    "script": (str, True, ""),
+    "inputs": (dict, False, {}),
+    "libraries": (list, False, []),
+    "profiler": (bool, False, False),
+    # Interpret only, as for POST /session.
+    "mode": (str, False, "interpret"),
+}
+
+# Identity only: the engine owns the bars, so AXIS never sends them on a tick.
+DATA_SESSION_TICK_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "exchange": (str, True, ""),
+    "symbol": (str, True, ""),
+    # Delta response: only changed tail cells instead of full series.
+    # Unchanged ticks answer with flags only (no plots/series at all).
+    "delta": (bool, False, False),
+}
+
+# Shared OHLCV + many scripts (AXIS multi-indicator). Nested script objects
+# are validated in the route (schema helper is flat only).
+RUN_BATCH_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "scripts": (list, True, []),
+    "data": (list, True, []),
+    "symbol": (str, False, "CHART"),
+    "data_source": (str, False, ""),
+    "data_options": (dict, False, {}),
+    "mode": (str, False, "auto"),
+    "profiler": (bool, False, False),
+    "webhook_url": (str, False, ""),
+    "forward_alerts": (bool, False, True),
+    "alert_last_bar": (bool, False, True),
+    "alert_batch": (bool, False, True),
+    # Same AXIS git-publish list as /run (max 32, parsed in the route).
+    "libraries": (list, False, []),
+    "timeout_seconds": (float, False, None),
+}
+
+# Hard cap to keep free-tier /run/batch bounded.
+RUN_BATCH_MAX_SCRIPTS = 8
+
+
+# Schema for POST /optimize (strategy HPO). Nested ``space`` / ``validation``
+# objects are checked in the route (schema helper is flat only).
+# ``min_trades`` default is 5; send 0 to disable the closed-trade floor.
+# User-input study failures are HTTP 400 with one of:
+#   NOT_A_STRATEGY, TOO_MANY_RUNS, GRID_TOO_LARGE, EMPTY_SPACE, NO_DATA,
+#   INVALID_OBJECTIVE, INVALID_SAMPLER, INVALID_VALIDATION, INVALID_SPACE
+# Unexpected engine crashes remain HTTP 500 OPTIMIZE_ERROR.
+OPTIMIZE_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "script": (str, True, ""),
+    "data": (list, True, []),
+    "space": (dict, True, {}),
+    "n_trials": (int, False, 30),
+    "sampler": (str, False, "auto"),
+    "objective": (str, False, "composite"),
+    "validation": (dict, False, {}),
+    "min_trades": (int, False, 5),  # 0 disables the trade-count floor
+    "seed": (int, False, None),
+    "symbol": (str, False, "CHART"),
+    "oos_every_trial": (bool, False, True),
+    "libraries": (list, False, []),
+    # Current Script Settings values for inputs not in the search space.
+    "fixed_inputs": (dict, False, {}),
+}
+
+
+# Schema for /preview/chart.
+PREVIEW_CHART_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "script": (str, False, ""),
+    "data": (dict, False, {}),
+    "options": (dict, False, {}),
+}
+
+
+# Schema for /preview/indicator.
+PREVIEW_INDICATOR_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "expression": (str, False, ""),
+    "data": (dict, False, {}),
+    "options": (dict, False, {}),
+}
+
+
+# Schema for /backtest/quick.
+BACKTEST_QUICK_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "script": (str, False, ""),
+    "data": (dict, False, {}),
+    "initial_capital": (float, False, 10000.0),
+    "mock_data": (bool, False, False),
+    "mock_bars": (int, False, 252),
+}
+
+
+# Schema for /auth/create_key.
+CREATE_KEY_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "tier": (str, False, "hobby"),
+}
+
+
+# Schema for /auth/validate.
+VALIDATE_KEY_SCHEMA: dict[str, tuple[type, bool, Any]] = {
+    "api_key": (str, True, ""),
+}
+
+
+def _coerce(value: Any, py_type: type) -> tuple[Any, str | None]:
+    """Return ``(value, error_message)``. ``error_message`` is None on success."""
+    # bool is a subclass of int in Python; treat it as a separate type.
+    if py_type is bool:
+        if not isinstance(value, bool):
+            return value, "must be a boolean"
+        return value, None
+    if py_type is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return value, "must be an integer"
+        return value, None
+    if py_type is float:
+        if isinstance(value, bool):
+            return value, "must be a number"
+        if not isinstance(value, (int, float)):
+            return value, "must be a number"
+        return float(value), None
+    if py_type is str:
+        coerced = _expect_str(value)
+        if coerced is None:
+            return value, "must be a string"
+        return coerced, None
+    if py_type is list:
+        coerced = _expect_list(value)
+        if coerced is None:
+            return value, "must be a list"
+        return coerced, None
+    if py_type is dict:
+        coerced = _expect_dict(value)
+        if coerced is None:
+            return value, "must be an object"
+        return coerced, None
+    return value, None  # pragma: no cover - unknown type, accept as-is
+
+
+def validate(body: Any, schema: dict[str, tuple[type, bool, Any]]) -> tuple[dict[str, Any] | None, tuple | None]:
+    """Validate ``body`` against ``schema``.
+
+    Returns ``(data, error_response)``. Exactly one is non-None. On success,
+    ``data`` is a dict containing only the schema fields (no extras).
+    """
+    if not isinstance(body, dict):
+        return None, (
+            jsonify(
+                {
+                    "status": "error",
+                    "code": "INVALID_BODY",
+                    "message": "Request body must be a JSON object.",
+                }
+            ),
+            400,
+        )
+
+    out: dict[str, Any] = {}
+    for field_name, (py_type, required, default) in schema.items():
+        if field_name not in body:
+            if required:
+                return None, (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "code": "MISSING_FIELD",
+                            "message": f"Missing required field: {field_name!r}.",
+                        }
+                    ),
+                    400,
+                )
+            out[field_name] = default
+            continue
+        value = body[field_name]
+        # Optional fields: null/empty treated as "use default" (common for WS
+        # clients that send "symbol": null when unset).
+        if value is None and not required:
+            out[field_name] = default
+            continue
+        coerced, err = _coerce(value, py_type)
+        if err is not None:
+            return None, (
+                jsonify(
+                    {
+                        "status": "error",
+                        "code": "INVALID_FIELD",
+                        "message": f"Field {field_name!r} {err}.",
+                    }
+                ),
+                400,
+            )
+        out[field_name] = coerced
+
+    # Reject unexpected fields. Stricter than pydantic's default but matches
+    # the spirit of S9: don't silently accept unknown input.
+    extras = set(body) - set(schema)
+    if extras:
+        return None, (
+            jsonify(
+                {
+                    "status": "error",
+                    "code": "UNKNOWN_FIELDS",
+                    "message": f"Unexpected field(s): {sorted(extras)}.",
+                }
+            ),
+            400,
+        )
+
+    return out, None

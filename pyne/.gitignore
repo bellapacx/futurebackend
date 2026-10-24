@@ -1,0 +1,165 @@
+
+*$py.class
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+.antlr/
+# ANTLR4
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+# Root build artifacts only (do not match scripts/build/)
+/build/
+# Byte-compiled / optimized / DLL files
+.cache
+celerybeat.pid
+celerybeat-schedule
+# Celery stuff
+# C extensions
+*.cover
+cover/
+.coverage
+.coverage.*
+coverage/
+coverage.lcov
+coverage.xml
+cython_debug/
+# Cython debug symbols
+db.sqlite3
+db.sqlite3-journal
+develop-eggs/
+dist/
+# Distribution / packaging
+# Django stuff:
+.dmypy.json
+dmypy.json
+docs/apidoc/
+docs/_build/
+downloads/
+*.egg
+*.egg-info/
+.eggs/
+eggs/
+.env
+env/
+ENV/
+env.bak/
+# Environments
+# Flask stuff:
+htmlcov/
+.hypothesis/
+#.idea/
+.ignore/
+.installed.cfg
+# Installer logs
+instance/
+.ipynb_checkpoints
+# IPython
+ipython_config.py
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+# Jupyter Notebook
+lib/
+lib64/
+local_settings.py
+*.log
+# LSP build artifacts
+*.manifest
+MANIFEST
+# mkdocs documentation
+*.mo
+# mypy
+.mypy_cache/
+nosetests.xml
+.nox/
+# Nuitka build
+*.onefile.exe
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+# Others
+parts/
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+# Local host / deploy notes (not shipped)
+.host/*
+# AXIS charting UI was extracted to https://github.com/jango-blockchained/axis
+# (do not re-add a local frontend/ tree here)
+pip-delete-this-directory.txt
+pip-log.txt
+*.pot
+profile_default/
+.pybuilder/
+# PyBuilder
+__pycache__/
+# PyCharm
+*.py[cod]
+*.py,cover
+# PyInstaller
+__pypackages__/
+.pypirc
+.pyre/
+# Pyre type checker
+.pytest_cache/
+.Python
+.pytype/
+# pytype static type analyzer
+.ropeproject
+# Rope project settings
+# ruff
+.ruff_cache/
+# SageMath parsed files
+*.sage.py
+.scrapy
+# Scrapy stuff:
+!scripts/
+scripts/build/.metadata.key
+sdist/
+share/python-wheels/
+/site
+*.so
+*.spec
+# Sphinx documentation
+.spyderproject
+# Spyder project settings
+.spyproject
+*.stats
+target/
+.tox/
+# Translations
+# Unit test / coverage reports
+#  Usually these files are written by a python script from a template
+var/
+.venv
+venv/
+venv.bak/
+vscode-extension/node_modules/
+vscode-extension/out/
+.webassets-cache
+wheels/
+
+# Bun
+node_modules/
+bun.lockb
+
+# Local private notes / agent sessions / tooling
+.private/
+.grok/
+.opencode/
+AGENTS.md
+
+# Local runtime / compose data
+logs/
+data/
+*.log
+
+# Docker / compose local overrides
+.env.local
+.env.*.local
+
+# VS Code extension packages (build artifacts)
+*.vsix
+
+# Accidental ANTLR output when cwd is the repo root (mirrors src/ into generated/)
+src/pynescript/ast/grammar/antlr4/generated/src/
+
+# Multi-agent coordination notes (local only — do not commit)
+.agent-sync-notice.md
+.agent_sync*.md
+.agent-sync/
+
+# Git worktrees (local isolation only)
+.worktrees/

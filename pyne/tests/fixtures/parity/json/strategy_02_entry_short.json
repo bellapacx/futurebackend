@@ -1,0 +1,21 @@
+[
+  {
+    "kind": "entry",
+    "id": "S",
+    "direction": "short",
+    "qty": 5.0,
+    "order_type": null,
+    "limit": null,
+    "stop": null,
+    "oca_name": null,
+    "comment": null,
+    "bar_index": 0,
+    "bar_time": 1000000,
+    "ohlc": [
+      99.71,
+      99.82,
+      98.84,
+      99.54
+    ]
+  }
+]

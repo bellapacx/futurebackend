@@ -1,0 +1,263 @@
+# Known divergences from reference Pine semantics
+
+**Date:** 2026-09-10 (refresh)
+**Status:** intentional or residual gaps; track until closed or product-scoped
+
+This page documents **semantic differences** between pynescript and **reference Pine Script** language behavior (as described in the public Pine language docs) that affect numerical or strategy results. It is not a full feature matrix (see `docs/missing_features.md` and `COMPATIBILITY.md`).
+
+---
+
+## Status at a glance
+
+Two tables, no prose. Every row links to its detail section below.
+Tables verified 2026-09-10 against the working tree — re-verify a row
+when moving it between tables.
+
+### Open divergences
+
+| ID | Area | Divergence | Details |
+|----|------|------------|---------|
+| D-01 | Strategy exits | Trail stops (`trail_*`) are OHLC-path approximations — no tick path | [§ Strategy → exits](#sec-exit-brackets) |
+| D-02 | Strategy risk | `max_position_size` %-of-equity by default, absolute contracts via `PYNE_STRATEGY_RISK_CONTRACTS=1` (reference: contracts); cash thresholds in account units without FX conversion; tick-accurate accounting | [§ Strategy → risk](#sec-risk-compile) |
+| D-03 | Trade queries | Per-trade `max_drawdown` / `max_runup` are OHLC-path approximations, not tick-accurate | [§ Strategy → trade queries](#sec-trade-queries) |
+| D-04 | Realtime `var` / `varip` | Numeric nopython does not poll. `CCXTProDataFeed.poll_ohlcv` is the last cached watch/fetch candle (no REST in the bar loop). Unconfirmed ticks roll back in-place array/matrix/map/UDT mutations and broker fills | [§ Evaluator → var/varip](#sec-varip) |
+| D-06 | `request.security` | No full HTF expression re-eval engine; `gaps` / `lookahead` still unused on passthrough / chart-length provider stubs / complex-na paths and for LTF requests | [§ Request → security](#sec-security) |
+
+### Fixed
+
+| ID | Area | Fix | In |
+|----|------|-----|----|
+| F-01 | Strategy exits | Pending stop/limit brackets + OCA (`process_pending_orders`) | Wave B ([details](#sec-exit-brackets)) |
+| F-02 | Strategy exits | `from_entry` leg filtering, interpret + compile | Wave B ([details](#sec-exit-brackets)) |
+| F-03 | Strategy exits | `qty_percent` on exit (`%` of target, capped at 100%) | Wave B ([details](#sec-exit-brackets)) |
+| F-04 | Strategy exits | `profit` / `loss` in ticks (× mintick from entry avg) | Wave B ([details](#sec-exit-brackets)) |
+| F-05 | Strategy risk | `strategy.risk.*` halt gates wired on the compile broker | Compile broker ([details](#sec-risk-compile)) |
+| F-06 | TA | `ta.atr` is Wilder RMA of TR (interpret + Numba) | Wave B ([details](#sec-atr)) |
+| F-07 | TA | EMA uses SMA seed over first `period` samples (all paths) | Fixed ([details](#sec-ema-seed)) |
+| F-08 | Evaluator | `AugAssign` / tuple-unpack keep series wrappers | Wave B ([details](#sec-augassign)) |
+| F-09 | Realtime | `var` / `varip` realtime window contract; `once` commits on confirmed bars | Partial Wave B / 0.4.4 ([details](#sec-varip)) |
+| F-10 | Quotes | `bid` / `ask` no longer mocked — `na` when the host omits quotes | Closed ([details](#sec-bidask)) |
+| F-11 | Linter | `C004` trailing-newline no longer `strip()`s before the check | Wave B ([details](#sec-linter)) |
+| F-12 | Linter | Legacy rules retired: `C003` (indented `if` without “braces” — Pine has none), `W102` (histogram → plotcandle), `W103` (`var int x = na` → 0); LSP noise filter for `C003` removed with the rule | 0.6.0 ([details](#sec-linter)) |
+| F-13 | Timeframes | `timeframe.change` D/W/M on the exchange calendar (`syminfo.timezone`, UTC default; DST-aware days, Monday weeks, calendar months); intraday unchanged; compile calendar TFs via object mode; disk IR cache v16 | 0.6.0 ([details](#sec-tf-change)) |
+| F-14 | Realtime | Intrabar rollback of `var` scope + series currents on interpret realtime ticks (`varip` persists via `_varip_declarations`); `once` fires once from confirmed state | 0.6.0 ([details](#sec-varip)) |
+| F-15 | Strategy risk | Intraday parity: `max_intraday_loss(value, type)` honors percent-of-initial-capital vs cash on both brokers; interpret enforces intraday loss + day-scoped fill cap; order-level fill counting on both hosts | 0.6.0 ([details](#sec-risk-compile)) |
+| F-16 | `request.security` | `gaps_on` / `lookahead_on` honored on HTF resample paths (OHLCV + allowlisted `ta.*`): bucket-start na-gaps; `lookahead_on` leaks each HTF bucket's final value from the period start; presence-vs-effect policy tags (`gaps_lookahead_provided` vs `gaps_applied` / `lookahead_applied`) | 0.6.0 ([details](#sec-security)) |
+
+---
+
+## Strategy
+
+<span id="sec-exit-brackets"></span>
+### `strategy.exit` pending brackets (fixed Wave B — trail still OHLC-approx)
+
+**Reference Pine:** `strategy.exit` places a pending stop/limit (bracket) that fills when price path touches the level.
+
+**pynescript (current):**
+
+| Piece | Status |
+|-------|--------|
+| Pending stop/limit brackets + OCA | **Fixed** (Wave B) — OHLC / `process_pending_orders`; market exit (no stop/limit/trail) still closes immediately |
+| `from_entry` (interpret) | **Fixed** — filters open-trade legs; unknown id is soft no-op (`tests/test_order_fills.py`) |
+| `from_entry` (compile) | **Fixed** — compiler emits `from_entry=` for market and stop/limit exits; multi-leg filter on compile broker (`tests/test_compiler_strategy.py`) |
+| `qty_percent` on exit | **Fixed** (interpret + compile `close`) — `%` of target (whole pos or `from_entry`); wins over `qty`; `≤0`/na → no-op; `>100` capped at 100% |
+| Trail stops (`trail_*`) | **Minimal (interpret + compile)** — `trail_offset` / `trail_points` (ticks × mintick) + optional `trail_price` activation; stop ratchets from bar high/low in `process_pending_orders` / compile `PendingOrder`, and on forming-bar realtime ticks after `poll_ohlcv` (persists across unconfirmed broker restore, like `varip`). OHLC path approx (no intra-bar tick path). |
+| `profit` / `loss` | **Fixed** (interpret + compile) — ticks × mintick from entry avg (`_tick_offset_price`). `limit`/`stop` stay absolute prices. Absolute wins if both set. `na` / None / `≤0` ignore that leg. |
+
+**Track:** forming-bar OHLC ratchet landed (interpret + object-mode compile + `InterpretSession.update_last_bar`); still no intra-bar tick path.
+
+<span id="sec-risk-compile"></span>
+### `strategy.risk.*` partial on compile path
+
+**pynescript compile broker (`CompileStrategyBroker`)** — minimal halt cascade (not full TV risk engine):
+
+| Call | Compile status |
+|------|----------------|
+| `strategy.risk.allow_entry_in` | **Wired** — stores state; blocks opposite-direction entries (`risk_blocked`) |
+| `strategy.risk.max_position_size` | **Wired** — caps entry qty to `%` of equity at fill price |
+| `strategy.risk.max_drawdown` | **Wired** — absolute and/or `%` of peak; sets `entries_blocked` when exceeded |
+| `strategy.risk.max_cons_loss_days` | **Wired** — consecutive calendar-day loss tracking on closes; halt when N hit |
+| `strategy.risk.max_intraday_loss` | **Wired on both brokers** — day PnL as `%` of initial capital or absolute cash; halt resumes the next `syminfo.timezone` calendar day |
+| `strategy.risk.max_intraday_filled_orders` | **Wired on both brokers** — counts entry+exit fills per tz calendar-day bucket; blocks new entries when cap hit (day-scoped; resets on next day) |
+
+**Impact:** common risk halt gates now share interpret-like `entries_blocked` + `risk_blocked` comments on compile (intraday loss and filled-order cap are day-scoped without a permanent halt).
+
+**Known residual:** `strategy.risk.max_position_size` defaults to a %-of-equity per-entry cap on both hosts (pinned). Set `PYNE_STRATEGY_RISK_CONTRACTS=1` for reference-style absolute contracts instead (both hosts, invalid values ignored). Cash thresholds stay account units without FX conversion; risk accounting is not tick-accurate.
+
+**D-02 landed:** `max_intraday_loss` halt clears when the calendar day rolls in `syminfo.timezone` (UTC default; DST-aware midnight-to-midnight, same rules as `timeframe.change`). Day-scoped fill cap uses the same bucket. A bar that is still “yesterday” in `America/New_York` does not resume. `max_drawdown` halt stays permanent. `allow_entry_in` is unchanged.
+
+**D-02 residual:** `max_position_size` %-of-equity by default (pinned); `PYNE_STRATEGY_RISK_CONTRACTS=1` switches both hosts to absolute contracts. Cash thresholds stay account units without FX conversion; risk accounting is not tick-accurate.
+
+**Intraday parity (0.6.0):** `strategy.risk.max_intraday_loss(value, type)` honors `type` on both brokers — percent-of-initial-capital by default (`percent` / `strategy.percent_of_equity` / `%`), absolute account-currency cash for `cash` / `strategy.cash` (no FX conversion; unknown types fall back to percent). Percent and cash are mutually exclusive. Interpret and compile both enforce the loss halt and the day-scoped fill cap in `_risk_allows_entry`, including pending `strategy.entry` / `strategy.order` fills. The fill cap and the loss halt reset on tz day roll.
+
+**Track:** audit AGENT_04; tests in `tests/test_compiler_strategy.py`, `tests/test_strategy_risk_intraday.py`, `tests/test_strategy_risk_day_resume.py`.
+
+<span id="sec-trade-queries"></span>
+### Open/closed trade query surface (compile) — partial honesty
+
+**Real (from `open_legs` / `closed_trade_records`):**
+
+- counts: `strategy.opentrades` → `open_entry_count`; `strategy.closedtrades` → `closed_trades`
+- open: `size`, `entry_price`, `entry_id`, `entry_bar_index`, `entry_time`, `commission`, `profit` (MTM), `entry_comment`, `max_drawdown` / `max_runup` (approx MAE/MFE from bar high/low, including forming-bar realtime ticks after `poll_ohlcv`)
+- closed: `profit`, `size`, `entry_price`, `exit_price`, `commission`, `entry_id`, `exit_id`, `entry/exit_bar_index`, `entry/exit_time`, `entry_comment` / `exit_comment`, `max_drawdown` / `max_runup` (copied from open-leg extremes at close)
+
+**D-03 landed:** forming-bar OHLC MAE/MFE (interpret + object-mode compile + `InterpretSession.update_last_bar`). After `poll_ohlcv` and after each unconfirmed broker restore, open-trade `max_drawdown` / `max_runup` follow the forming bar's high/low (`update_open_trade_extremes`; persists across restore like `varip`). Fills still roll back. Historical `realtime_ticks=1` is unchanged.
+
+**Residual:** per-trade max_dd/runup are OHLC-path approximations (not tick-accurate); multi-leg close aggregates max extremes across reduced legs. Still no intra-bar tick path.
+
+**Track:** audit AGENT_04; `tests/test_compiler_strategy.py` (`TestCompileTradeQueries`), `tests/test_mae_realtime_ticks.py`.
+
+---
+
+## Technical analysis
+
+<span id="sec-atr"></span>
+### `ta.atr` Wilder RMA (fixed Wave B — re-golden dependents)
+
+**Reference Pine:** ATR is `ta.rma(ta.tr, length)` (Wilder smoothing).
+
+**pynescript (after Wave B):** interpret (`_atr` / `_atr_inc_update`) and Numba (`numba_atr` / `numba_atr_inc`) use **RMA of TR**. Supertrend/KC/other ATR consumers inherit the change; golden vectors may need refresh if any hard-code EMA-era values.
+
+**Track:** audit AGENT_03.
+
+<span id="sec-ema-seed"></span>
+### EMA seed (fixed — dual-host SMA seed)
+
+Full-list `_ema` / `_ema_state_step` and incremental / Numba paths all use **SMA seed** over the first `period` finite samples (na until ready). Nested EMA and KC middle band inherit this contract. First-party bar-mode goldens gate residual dual-host drift (`tests/test_first_party_ta_goldens.py`, `tests/test_ta_incremental.py`).
+
+---
+
+## Evaluator / series
+
+<span id="sec-varip"></span>
+### `var` / `varip` realtime (partial Wave B)
+
+**Reference Pine:** On a forming bar the host re-executes the script on each tick. Non-`varip` state is rolled back to the last confirmed bar; `varip` persists across ticks. Full rollback + committed-state snapshot is host-dependent.
+
+**pynescript (current contract):**
+
+| Mode | Behavior |
+|------|----------|
+| Historical default (`Runtime.run` without realtime kwargs) | `barstate.isrealtime=False` always. `var` and `varip` both **init-once** (first execution of the declaration). |
+| `Runtime.run(..., realtime_last_bar=True)` | Last bar only: `isrealtime=True`, `ishistory=False`. Final tick sets `isconfirmed=True`; earlier multi-ticks unconfirmed. |
+| `Runtime.run(..., realtime_ticks=N)` (`N>1`) | Re-visits the **last bar** `N` times with `isrealtime=True` (implies last-bar realtime). Intermediate ticks discard plot cells so series length stays one sample per bar. |
+| `Runtime.run(..., realtime_bars=K)` (`K>0`) | Last *K* bars form a realtime window: each is multi-tick re-eval with `isrealtime=True`. Bars before the window stay historical (`ishistory=True`, `isrealtime=False`). |
+| `Runtime.run(..., realtime_from_bar=I)` | Absolute window start: bars in `[I, n_bars)` are realtime-forming (overrides `realtime_bars` / last-bar-only for window extent). |
+| When `isrealtime` | Evaluator **re-evaluates `varip` RHS** each visit; `var` does **not** re-init (keeps prior binding). Unconfirmed ticks restore container contents (one extra list/dict nesting level) and broker fills / pending-book / strategy events (confirmed tick commits). History pushes and the series-assign map are left alone so `x[1]` keeps working. |
+
+**`once` (0.4.4 / D-04 compile):** interpret and object-mode compile commit the fired flag only when `barstate.isconfirmed` (so unconfirmed realtime ticks can re-run the body). Numeric nopython stays historical (`isconfirmed` always true). Side effects inside the body still follow the `var` / `varip` contract above — there is no extra snapshot of non-`varip` state just for `once`.
+
+**Intrabar rollback (0.6.0 / D-04 containers):** on interpret realtime bars, intermediate ticks snapshot the `var` scope (context bindings + container contents + series `.current` + declaration set) and restore it after the visit, so every tick starts from confirmed state and only the final tick commits. Restore writes list/dict/Matrix/Map/UDT-field contents back into the same outer objects so aliases keep identity. List/dict payloads copy one extra nesting level (`a.get(0).push(x)` / `outer[0].append(x)` / dict-of-lists), so unconfirmed inner mutations roll back. `varip` names (tracked in `_varip_declarations`) are excluded and persist. Deeper nesting plus Matrix/Map internals are still best-effort (not a generic deepcopy). History pushes and the series-assign map are left alone so `x[1]` keeps working on forming bars.
+
+**Broker rollback (D-04):** unconfirmed realtime ticks snapshot `StrategyState` / `CompileStrategyBroker` (pending book, open/closed trades, position, equity peaks, `_events` / compile `events`, strategy hist lists) and restore onto the same object after the visit. Body-placed `strategy.entry` / `order` / `close` therefore commit only on the confirmed tick. `InterpretSession.update_last_bar` restores the bar-open broker snapshot the same way (forming ticks do **not** accumulate fills); confirmed `append_bars` re-visits from that snap and commits. Pending OHLC fills still run **once per bar** before the tick loop (`process_pending_orders` / compile `begin_bar` stay outside it — a last-bar body-placed limit waits for a later bar). After restore, trail stops (`ratchet_trails`; D-01) and open-trade MAE/MFE (`update_open_trade_extremes`; D-03) are re-applied from the forming bar's high/low. Still no intra-bar tick path. Historical `realtime_ticks=1` is unchanged.
+
+**Compile multi-pass (D-04):** object-mode `execute_script_compiled(..., rt_first=None, rt_ticks=1, data_feed=None, feed_symbol="")` re-visits bars in `[rt_first, n_bars)` `rt_ticks` times with `__isrealtime` / `__isconfirmed` / `__ishistory` / `__isnew` per tick. Intermediate ticks overwrite the same plot cell (series length stays one sample per bar) and do not latch `once`. `varip` re-inits while `var` commits on the confirmed tick. List/dict locals are content-copied plus one extra inner list/dict level (slice restore) so `array.push` / `map.put` / nested `a.get(0).push` on a `var` handle roll back; `varip` names are skipped. `__strategy.snapshot()` / `restore()` run on unconfirmed ticks; `begin_bar` stays outside the tick loop. Host `_run_compiled` forwards the same `Runtime.run` realtime kwargs and `data_feed`; an active window re-emits object mode so numeric scripts can opt in without changing the historical nopython path. Disk IR cache v24.
+
+**Feed-driven ticks (D-04):** when `Runtime.run(..., data_feed=)` is set and a realtime window is active, each last-bar tick (interpret and object-mode compile) calls sync `DataFeed.poll_ohlcv` / `poll_forming_ohlcv` and evaluates against that forming OHLCV (`MockDataFeed` is deterministic / scriptable; a `None` poll is a no-op). Without a feed, ticks still re-visit the same historical last-bar OHLC. `InterpretSession.update_last_bar` is unchanged (host still pushes forming bars). Numeric nopython does not poll. `CCXTProDataFeed.poll_ohlcv` returns the last candle cached from `watch_ohlcv` / `watch_ohlcv_for_symbols` / `fetch_latest_ohlcv` (sync, no new socket). Until a watch/fetch has run, it is `None`.
+
+**Track:** audit AGENT_02; host kwargs in `pynescript.runtime.host.Runtime.run`; dual-host tests in `tests/test_compiler_realtime.py`.
+
+<span id="sec-tf-change"></span>
+### `timeframe.change` (calendar D/W/M, fixed-width otherwise)
+
+**Reference Pine:** First bar of a new *higher* period on the **exchange calendar** (session-aware daily/weekly/monthly).
+
+**pynescript:** Bare `D` / `W` / `M` (plus `1D` / `1W` / `1M`) resolve on the exchange calendar in `syminfo.timezone` — midnight-to-midnight days (DST-aware via zoneinfo), ISO Monday-start weeks, calendar months. Days are **not session-aware** (NYSE 09:30 does not start the day). The host default zone is UTC; set `_syminfo.timezone` for a non-UTC exchange. All other frames (intraday, multi-day like `3D`) keep fixed-width UTC buckets. Unusable timestamps or zones → `False` / UTC fallback, never raise.
+
+**Dual-host:** interpret and compile-object-mode share `timeframe_period_changed` (interpret reads the zone from context `syminfo`; compile threads `chart_timezone()` into `timeframe_change_at`). Constant calendar TFs compile in object mode — Numba cannot express tz rules — and dynamic TF strings resolve the same helper at run time, so both hosts agree. Unknown zones behave like UTC on both.
+
+**Track:** `tests/test_timeframe_change.py` (DST spring-forward, Monday weeks, leap months, bad-zone fallback, syminfo wiring, weekly dual-host parity). Disk IR cache bumped to v16 (codegen routing changed).
+
+<span id="sec-augassign"></span>
+### `AugAssign` / tuple unpack series bind (fixed Wave B)
+
+Both paths now call `_bind_series_name` so history-tracked names keep series wrappers.
+
+<span id="sec-bidask"></span>
+### Omitted bid/ask
+
+When the host omits quotes, `bid`/`ask` are **na (`None`)**, not mock prices (`100.01` / `100.02`). Defaults are filled with `setdefault` so a host or `data_feed` still wins when it sets quotes.
+
+**Impact:** Tick/spread scripts see `na` until the host injects real quotes.
+
+**Track:** audit AGENT_02 (closed residual).
+
+---
+
+## Request / multi-timeframe
+
+<span id="sec-security"></span>
+### `request.security` is not a full HTF re-eval engine
+
+**Reference Pine:** `request.security(symbol, timeframe, expression, gaps, lookahead)` re-evaluates *expression* on another symbol/timeframe series; `barmerge.gaps_*` controls na gaps vs fill; `barmerge.lookahead_*` controls whether the security series can peek at the forming HTF bar.
+
+**pynescript (current — honest limited surface):**
+
+| Case | Behavior |
+|------|----------|
+| Foreign ticker + host chart wired + no multi-symbol feed hit | **`na`** (no mock invent; matches compile foreign-na) |
+| Same-symbol + **complex** pre-eval (UDF / nested / non-allowlist `ta.*`) + request TF ≠ chart TF | **`na`** — no full multi-TF re-eval engine (do not invent HTF structure) |
+| Same-symbol + **simple OHLCV** + request TF **coarser** than chart bar spacing (parseable fixed TF or bare `D`/`W`/`M`, bar times present) | **Timestamp / calendar resample** of chart OHLCV (`htf_ohlcv_resample`): open/high/low/close/volume/time/hl2/hlc3/ohlc4 on **last completed** HTF bucket only (lookahead_off-style). Bare `D`/`W`/`M` use the same calendar ids as `timeframe.change` (`3D` / `2W` stay fixed-width). |
+| **Provider/feed simple OHLCV** already **coarser** than the chart, with bar times that align to chart bars | **Provider HTF merge** (`provider_htf_ohlcv`): map unique provider bars onto chart bars by timestamp; same `gaps_on` / `lookahead_on` as chart resample. Chart-length / no-timestamp payloads (e.g. `ChartOHLCVProvider` ignoring `interval`) stay stubs with unused merge. No LTF invention. |
+| Same-symbol + **allowlisted simple ta.*** (`ta.sma` / `ta.ema` / `ta.rsi` / `ta.wma` / `ta.rma` / `ta.cmo` / `ta.stdev` / `ta.linreg` / `ta.cci` / `ta.roc` / `ta.mom` / `ta.hma` / `ta.vwma` / `ta.dema` / `ta.tema` / `ta.highest` / `ta.lowest` / `ta.range` / `ta.median` / `ta.dev` / `ta.variance` / `ta.mode` / `ta.percentrank` / `ta.change` / `ta.cog` / `ta.highestbars` / `ta.lowestbars` / 2-arg `ta.kama` / `ta.rising` / `ta.falling` / `ta.swma` with bare OHLCV source + const length; `ta.atr(length)`; 1-arg `ta.cci(length)` on HTF hlc3; 1-arg `ta.wpr(length)` on HTF high/low/close; 1-arg `ta.adx(length)` on HTF high/low/close; 1-arg `ta.mfi(length)` on HTF high/low/close/volume; 0-arg `ta.obv()` on HTF close+volume; 0-arg `ta.nvi()` / `ta.pvi()` on HTF close+volume; 0-arg `ta.accdist()` / `ta.wad()` on HTF high/low/close/volume; 0-arg `ta.tr()` on HTF high/low/close; 2-arg `ta.tsi(short, long)` on HTF close; 2-arg `ta.bbw(n, mult)` / 3-arg `ta.bbw(source, n, mult)` on HTF source (default close); 1-arg `ta.stoch(n)` / 2-arg `ta.stoch(k, d)` %K on HTF high/low/close (dPeriod stored unused); 2-arg `ta.pivothigh(left, right)` on HTF high / 2-arg `ta.pivotlow(left, right)` on HTF low (optional 3-arg OHLCV source); 3-arg `ta.percentile_nearest_rank(source, n, percentage)` / `ta.percentile_linear_interpolation(source, n, percentage)` (percentage const int, 0 ok; not `ta.percentrank`); 1-arg `ta.dpo(n)` on HTF close; 2-arg `ta.dpo(source, n)`; 2-arg `ta.crossover` / `ta.crossunder` / `ta.cross` of OHLCV names; 3-arg `ta.correlation` of two OHLCV names; 1-arg `ta.cmf(length)` on HTF high/low/close/volume; 0-arg `ta.vpt()` / `ta.pvt()` on HTF close+volume; 1-arg `ta.wvad(length)` on HTF high/low/close/volume; 3-arg `ta.uo(n1, n2, n3)` on HTF high/low/close; 3-arg `ta.apo(source, fast, slow)` on HTF source; 1-arg `ta.emv(length)` on HTF high/low/volume; 1-arg `ta.highest(length)` / `ta.highestbars(length)` on HTF high; 1-arg `ta.lowest(length)` / `ta.lowestbars(length)` on HTF low; 1-arg `ta.range(length)` on HTF high−low; 0-arg `ta.ao()` on HTF hl2 SMA 5−34; 1-arg `ta.ao(fast)` (slow 34); 2-arg `ta.ao(fast, slow)`; 3-arg `ta.linreg(source, n, offset)`; 0-arg `ta.vwap()` on HTF hlc3; 1-arg `ta.vwap(source)`; 1-arg `ta.cum(source)`; 1-arg `ta.change(source)` (length 1)) + request TF **coarser** | **HTF series TA** (`htf_simple_ta_resample`): bucket chart bars → run interpret TA helper on unique completed HTF OHLCV → map last completed value to chart bars. Not arbitrary AST re-eval. 4-arg `ta.cci` / `ta.wpr`, 2-arg `ta.adx(diLength, adxSmoothing)`, 4-arg `ta.adx`, 2-arg `ta.obv(close, volume)`, 2-arg `ta.nvi(close, volume)` / `ta.pvi(close, volume)`, 4-arg `ta.accdist` / `ta.wad`, 3-arg `ta.tr(high, low, close)` / `ta.tsi(source, short, long)`, nested / 1-arg `ta.bbw`, 4-arg `ta.stoch(source, high, low, length)`, nested `ta.pivothigh` / `ta.pivotlow`, nested / non-int `ta.percentile_nearest_rank` / `ta.percentile_linear_interpolation`, nested `ta.dpo`, nested `ta.crossover` / `ta.crossunder` / `ta.cross`, nested `ta.correlation`, nested `ta.vpt`, 4-arg `ta.wvad`, nested `ta.uo`, nested `ta.apo`, nested `ta.emv`, 5-arg `ta.cmf`, `ta.kama` 3/4-arg, and 2-arg / 3-arg `ta.vwap` stay complex-na. |
+| Same-symbol + **OHLCV history offset** (`close[1]`, …) + request TF **coarser** | **HTF offset resample** (`htf_ohlcv_offset`): offset is taken on unique HTF bars (TV non-repaint pattern with `lookahead_on`). |
+| Same-symbol + **simple OHLCV** otherwise (same TF, LTF, unparseable TF, …) | Chart series **passthrough** / provider series (`same_tf_chart_eval` / `chart_passthrough_htf_stub`) |
+| Same-symbol `ticker.heikinashi` | Chart OHLC → Heikin-Ashi transform (not raw chart candles) |
+| `barmerge.gaps_on` / `gaps_off` | **Honored on HTF resample paths** (chart + provider-backed coarser OHLCV); still unused on passthrough / chart-length provider stubs / complex-na / LTF — see below |
+| `barmerge.lookahead_on` / `lookahead_off` | **Honored on HTF resample paths** (chart + provider-backed coarser OHLCV); still unused on passthrough / chart-length provider stubs / complex-na / LTF — see below |
+| Fundamentals / footprint / dividends / … | Honest `na` without a provider hook; footprint stays structured mock (see module docstring) |
+| Standalone evaluator (no chart identity) | Legacy mock OHLCV for bare string series names (offline demos) |
+
+**HTF resample limits (intentional):** bare series fields (`close`, `open`, …) / string names, allowlisted simple `ta.*` shapes, and inline history offsets such as `close[1]`. Not nested `ta.sma(ta.ema(...))`, multi-arg ATR, 4-arg `ta.cci` / `ta.wpr`, 2-arg `ta.adx(diLength, adxSmoothing)`, 4-arg `ta.adx`, 2-arg `ta.obv(close, volume)`, 2-arg `ta.nvi(close, volume)` / `ta.pvi(close, volume)`, 4-arg `ta.accdist` / `ta.wad`, 3-arg `ta.tr` / `ta.tsi`, nested / 1-arg `ta.bbw`, 4-arg `ta.stoch(source, high, low, length)`, nested `ta.pivothigh` / `ta.pivotlow`, nested / non-int `ta.percentile_nearest_rank` / `ta.percentile_linear_interpolation`, nested `ta.dpo`, nested `ta.crossover` / `ta.crossunder` / `ta.cross`, nested `ta.correlation`, nested `ta.vpt`, 4-arg `ta.wvad`, nested `ta.uo`, nested `ta.apo`, nested `ta.emv`, 5-arg `ta.cmf`, `ta.kama` 3/4-arg, 2-arg / 3-arg `ta.vwap`, or UDF bodies. Expression must appear **inline** as the security third arg AST (pre-bound variables stay on the complex/na path).
+
+**Barmerge on resample paths (0.6.0):** `gaps_on` delivers the resampled value only on the first chart bar of an HTF bucket (`na` elsewhere). `lookahead_on` shows each HTF bucket's **final** value from the period start on historical bars (TV lookahead bias / repaint). Combine with `close[1]` (now resampled on the HTF unique series) for the TV non-repaint pattern. The two compose: `gaps_on` + `lookahead_on` yields the leaked final value on bucket-start bars, including bar 0 of the first period. Single-bar charts fall back to chart-period inference and may take the passthrough stub on bar 0 (pre-existing edge, same as `gaps_off`).
+
+**Provider HTF merge:** when `data_provider` / `data_feed` returns a **coarser** OHLCV series with bar times, interpret **and object-mode compile** align those bars to the chart by timestamp and run the same `_select_htf_agg` / `_htf_bar_is_bucket_start` merge as chart resample (`provider_htf_ohlcv`, `gaps_applied` / `lookahead_applied`). `ChartOHLCVProvider` ignores `interval` and returns chart-length bars — that stub keeps unused merge args (`gaps_lookahead_provided` without `gaps_applied`; compile still chart-resamples same-symbol / na on foreign). Nested `ta.*`, LTF, and no-timestamp payloads are unchanged.
+
+Runtime **interpret** results expose honesty metadata when any `request.security` ran:
+
+- `meta.request_security.htf_reeval` → always `false` (OHLCV/simple-ta resample is not a full expression re-eval engine)
+- `meta.request_security.gaps_supported` / `lookahead_supported` → `true` once a resample call actually honored them (still `false` on passthrough / chart-length provider stubs / complex-na / LTF)
+- `meta.request_security.policies` → tags such as `htf_ohlcv_resample`, `provider_htf_ohlcv`, `htf_simple_ta_resample`, `complex_htf_na`, `chart_passthrough_htf_stub`, `foreign_na`, `gaps_lookahead_provided`, `gaps_applied`, `lookahead_applied`, `same_tf_chart_eval`, …
+- `meta.request_security.notes` → short product notes (same text as evaluator)
+
+Regression coverage: `tests/test_request_data_feed.py` (foreign-na, complex HTF na, HTF OHLCV resample hourly→daily / 1m→60m, provider HTF daily-on-1h gaps/lookahead + ChartOHLCVProvider unused-merge, HTF simple ta.sma/ema/rsi/atr/wma/rma/cmo/stdev/linreg/cci/roc/mom/hma/vwma/dema/tema/highest/lowest/range/median/dev/variance/mode/percentrank/change/cog/highestbars/lowestbars/kama/rising/falling/swma/ao/vwap/cum + 1-arg cci/wpr/highest/lowest/highestbars/lowestbars/range/adx/mfi/cmf/stoch + 0-arg obv/nvi/pvi/accdist/wad/tr + 2-arg tsi + 2-arg/3-arg bbw + 1-arg/2-arg stoch + 2-arg pivothigh/pivotlow + 3-arg percentile_nearest_rank/percentile_linear_interpolation + 1-arg dpo + 2-arg dpo + 2-arg crossover/crossunder/cross of OHLCV names + 3-arg correlation of OHLCV names + 0-arg vpt/pvt + 1-arg wvad + 3-arg uo + 3-arg apo + 1-arg emv + 1-arg ao + 2-arg ao + 3-arg linreg + 1-arg change, nested ta still na, gaps/lookahead on resample paths + unused-on-passthrough, Runtime meta). Compile dual-host: `tests/test_request_security_compile_htf.py` (chart HTF helpers **and** provider/feed HTF `gaps_on` / `lookahead_on`; ChartOHLCVProvider-like stubs stay unused-merge).
+
+**Impact:** MTF indicators that need full expression re-eval on HTF still diverge from reference Pine, as do LTF requests and passthrough / complex-na merge args. Provider-backed coarser OHLCV with timestamps now honors `gaps_on` / `lookahead_on` on **interpret and object-mode compile** (`Runtime.run(..., data_provider=)` / `data_feed`). Compile resamples the same allowlisted chart HTF shapes as interpret (simple OHLCV, `close[1]`, `ta.sma/ema/rsi/atr/wma/rma/cmo/stdev/linreg/cci/roc/mom/hma/vwma/dema/tema/highest/lowest/range/median/dev/variance/mode/percentrank/change/cog/highestbars/lowestbars/kama/rising/falling/swma/ao/vwap/cum`, 1-arg `ta.cci(n)` / `ta.wpr(n)` / `ta.highest(n)` / `ta.lowest(n)` / `ta.highestbars(n)` / `ta.lowestbars(n)` / `ta.range(n)` / `ta.adx(n)` / `ta.mfi(n)` / `ta.cmf(n)`, 0-arg `ta.obv()`, 0-arg `ta.nvi()` / `ta.pvi()`, 0-arg `ta.accdist()` / `ta.wad()`, 0-arg `ta.tr()`, 2-arg `ta.tsi(short, long)`, 2-arg `ta.bbw(n, mult)` / 3-arg `ta.bbw(source, n, mult)`, 1-arg `ta.stoch(n)` / 2-arg `ta.stoch(k, d)` %K, 2-arg `ta.pivothigh(left, right)` / `ta.pivotlow(left, right)`, 3-arg `ta.percentile_nearest_rank(source, n, percentage)` / `ta.percentile_linear_interpolation(source, n, percentage)`, 1-arg `ta.dpo(n)`, 2-arg `ta.dpo(source, n)`, 2-arg `ta.crossover` / `ta.crossunder` / `ta.cross` of OHLCV names, 3-arg `ta.correlation` of two OHLCV names, 0-arg `ta.vpt()` / `ta.pvt()`, 1-arg `ta.wvad(n)`, 3-arg `ta.uo(n1, n2, n3)`, 3-arg `ta.apo(source, fast, slow)`, 1-arg `ta.emv(n)`, 1-arg `ta.ao(fast)`, 2-arg `ta.ao(fast, slow)`, 3-arg `ta.linreg(source, n, offset)`, 0-arg `ta.vwap()` / 1-arg `ta.vwap(source)`, 1-arg `ta.cum(source)`, 1-arg `ta.change(source)`) in object mode via the interpret helpers. Chart-length / no-timestamp provider stubs stay unused-merge. Still not a full HTF expression re-eval engine: nested `ta.*`, UDFs, 2-arg `ta.adx`, 4-arg `ta.adx`, 2-arg `ta.obv`, 2-arg `ta.nvi` / `ta.pvi`, 4-arg `ta.accdist` / `ta.wad`, 3-arg `ta.tr` / `ta.tsi`, nested / 1-arg `ta.bbw`, 4-arg `ta.stoch`, nested `ta.pivothigh` / `ta.pivotlow`, nested / non-int `ta.percentile_nearest_rank` / `ta.percentile_linear_interpolation`, nested `ta.dpo`, nested `ta.crossover` / `ta.crossunder` / `ta.cross`, nested `ta.correlation`, nested `ta.vpt`, 4-arg `ta.wvad`, nested `ta.uo`, nested `ta.apo`, nested `ta.emv`, 5-arg `ta.cmf`, `ta.kama` 3/4-arg, 2-arg / 3-arg `ta.vwap`, foreign tickers without a coarser provider series, LTF, and unparseable TFs stay `na` / chart passthrough as before. Disk IR cache v50.
+
+**Track:** audit AGENT_03; full multi-TF host engine is out of product scope until explicitly scheduled.
+
+---
+
+<span id="sec-linter"></span>
+## Linter (tooling, not runtime)
+
+**Fixed (Wave B):** `C004` trailing-newline check no longer `strip()`s before `endswith("\n")`.
+
+**Fixed (0.6.0):** legacy rules retired and codes left
+retired so history stays greppable — `C003` (every indented `if`
+flagged for missing “braces” in a braceless language), `W102`
+(histogram plots nudged toward plotcandle, which is not a substitute),
+`W103` (`var int x = na` nudged toward `0`, which changes semantics).
+The LSP-side `C003` noise filter (`_c003_is_block_if`) was removed with
+the rule. `C001` (camelCase for `ta.*` names) stays as a heuristic,
+with the already-camelCase false hits still filtered downstream.
+
+**Track:** `tests/test_linter.py` (`TestRetiredRules`); audit AGENT_01.
+
+---
+
+## Product scope notes
+
+| Area | Policy |
+|------|--------|
+| Dual-host parity (interpret ↔ compile) | Primary correctness contract for supported surface |
+| Runtime host SoT | **`pynescript.runtime`** (package owns bar loop); `backend.runtime` / `backend.evaluator` / `backend.series` are compat shims |
+| Package façade tests | `tests/test_runtime_package.py` (import + interpret smoke + shim identity) |
+| TA incremental / goldens | CI Core runtime: `test_ta_incremental`, `test_first_party_ta_goldens` |
+| Reference Pine numerical fidelity | Best-effort; known gaps listed above |
+| Free Pro API tier | Chart/mock data only; bar/script/rate/concurrency caps; SSRF-safe webhooks |
+| Third-party corpora | Not required for CI; first-party fixtures under `tests/fixtures/first_party/` / `tests/data/first_party/` |
+| pyne-worker / pine-worker | **Not colocated** — sibling `hoox-sh/pyne-worker` is a thin wrap over package Runtime; TS `hoox-sh/pine-worker` is a separate checkout |
+
+When closing a gap, remove or update the corresponding section here and add a regression test under `tests/`.

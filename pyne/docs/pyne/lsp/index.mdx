@@ -1,0 +1,127 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+title: "Language Server"
+description: "PYNE Language Server Protocol — diagnostics, completion, hover, formatting for .pyne / .pine and editor clients."
+---
+
+# Language Server
+
+The PYNE **Language Server** is the editor-facing half of the evaluation stack: a pygls process that speaks LSP over STDIO (or TCP in tooling), parses Pine with the same ANTLR4 → ASDL pipeline as the runtime, and never requires a proprietary chart host. First-class file associations include **`.pyne`** (product extension) plus `.pine` / `.pinev5` / `.pinev6` / `.pinescript`.
+
+## Abstract
+
+Editors want *static* intelligence at typing cadence. Evaluation over OHLCV is *dynamic* and bar-loop expensive. PYNE therefore splits the stack:
+
+| Process | Cadence | Shared substrate |
+| --- | --- | --- |
+| **LSP** (`pyne-lsp`) | keystroke / open / save | parse, lint, unparse, builtin metadata |
+| **Pro API** (`backend.app`) | request / batch | parse, evaluate, plots / events / alerts |
+| **CLI / library** | batch / embed | same AST + evaluator |
+
+The LSP publishes diagnostics from the linter and parse errors, completes and hovers from Fernet-ready builtin metadata (plus keywords and user enums), navigates user symbols via AST visitors, emits semantic tokens (full and range) from the cached tree, and formats by round-tripping through the unparser (including on-type after newline). Inlay hints cover assignment types and builtin parameter names; linked editing, document links, and document color round out the editor surface. Feature modules live under `src/pynescript/langserver/features/`; the VS Code extension (`hoox-sh.pyne` **0.4.4**) and `clients/` configs are thin protocol hosts — VS Code maps **`.pyne` first**, then legacy Pine suffixes, to language id `pinescript`. The stdio image is **`ghcr.io/hoox-sh/pyne/lsp`**.
+
+## Conceptual model
+
+```mermaid
+flowchart TB
+  subgraph Editors
+    VS[VS Code extension]
+    NV[Neovim / Helix / Zed / Emacs]
+  end
+  subgraph LSP["pyne-lsp (pygls)"]
+    S[PynescriptLanguageServer]
+    W[Workspace + TextDocumentState]
+    F[Feature handlers]
+    M[Builtin metadata provider]
+  end
+  subgraph Core
+    P[parse / lint / unparse]
+    A[ASDL AST]
+  end
+  VS -->|stdio LSP| S
+  NV -->|stdio LSP| S
+  S --> W
+  S --> F
+  F --> M
+  W --> P
+  F --> P
+  P --> A
+```
+
+**Invariant:** open/change/close always re-parse and re-lint the in-memory buffer. Features that need an AST re-parse on demand if the workspace cache is missing source.
+
+## Interface surface
+
+| Capability | LSP method(s) | Module |
+| --- | --- | --- |
+| Sync | `textDocument/didOpen|didChange|didClose|didSave` | `server.py` + `workspace.py` |
+| Diagnostics (push + pull) | `publishDiagnostics`, `textDocument/diagnostic` | `workspace.py`, `features/diagnostics.py` |
+| Completion (+ resolve) | `textDocument/completion`, `completionItem/resolve` | `features/completion.py` |
+| Hover | `textDocument/hover` | `features/hover.py` |
+| Signature help | `textDocument/signatureHelp` | `features/signature_help.py` |
+| Definition / references | `textDocument/definition`, `textDocument/references` | `definitions.py`, `references.py` |
+| Highlight / rename | `textDocument/documentHighlight`, `prepareRename`, `rename` | `highlight.py`, `rename.py` |
+| Linked editing | `textDocument/linkedEditingRange` | `features/linked_editing.py` |
+| Symbols | `textDocument/documentSymbol`, `workspace/symbol` | `symbols.py`, `server.py` |
+| Formatting | `textDocument/formatting`, `rangeFormatting`, `onTypeFormatting` | `features/formatting.py` |
+| Inlay hints | `textDocument/inlayHint`, `inlayHint/resolve` (types + builtin param names) | `features/inlay_hints.py` |
+| Folding | `textDocument/foldingRange` | `features/folding.py` |
+| Selection range | `textDocument/selectionRange` | `features/selection_range.py` |
+| [Document color](/pyne/docs/lsp/features/document-color) | `textDocument/documentColor`, `colorPresentation` | `features/document_color.py` |
+| [Document links](/pyne/docs/lsp/features/document-link) | `textDocument/documentLink`, `documentLink/resolve` (tooltip) | `features/document_link.py` |
+| Code action | `textDocument/codeAction` | `convert.py` (Convert-to-v6 + W001/W002/C002 QuickFix) |
+| Semantic tokens | `textDocument/semanticTokens/full`, `textDocument/semanticTokens/range` | `features/semantic_tokens.py` |
+
+Declared capabilities: `src/pynescript/langserver/config.py` (`get_server_capabilities`).
+
+## Internals
+
+| Path | Role |
+| --- | --- |
+| `src/pynescript/langserver/server.py` | `PynescriptLanguageServer`, method registration |
+| `src/pynescript/langserver/workspace.py` | Document map, incremental edits, parse+lint |
+| `src/pynescript/langserver/config.py` | ServerCapabilities |
+| `src/pynescript/langserver/features/*` | Per-method handlers |
+| `src/pynescript/langserver/providers/*` | Metadata + completion builders |
+| `src/pynescript/langserver/__main__.py` | STDIO entry (`pyne-lsp` / alias `pynescript-lsp`) |
+| `vscode-extension/` | Language client + TextMate grammar (`hoox-sh.pyne` 0.4.4) |
+| `clients/` | Neovim, Zed, Emacs snippets (Helix / Sublime are documented, not files) |
+
+Console scripts are separate: `pyne` (Click CLI; alias `pynescript`) vs `pyne-lsp` (pygls; alias `pynescript-lsp`). Do not conflate them — see [architecture](/pyne/docs/lsp/architecture).
+
+## Tracks in this tab
+
+1. [Architecture](/pyne/docs/lsp/architecture) — server lifecycle, workspace, capabilities
+2. [Diagnostics](/pyne/docs/lsp/features/diagnostics) through [Selection range](/pyne/docs/lsp/features/selection-range) — feature manuals
+3. [Linked editing](/pyne/docs/lsp/features/linked-editing) — same-document live ident ranges
+4. [Document links](/pyne/docs/lsp/features/document-link) — `http(s)` URLs in comments and strings; resolve fills tooltip
+5. [Document color](/pyne/docs/lsp/features/document-color) — `#hex` / `color.*` / literal `color.rgb` swatches
+6. [Builtin metadata](/pyne/docs/lsp/builtin-metadata) — generation + Fernet `.enc` / `CRYPTO_KEY`
+7. [VS Code extension](/pyne/docs/lsp/vscode-extension) — client packaging
+8. [Clients](/pyne/docs/lsp/clients) — Neovim, Zed, Emacs, Helix, Sublime
+
+## See also
+
+- [Pro API](/pyne/docs/api) — HTTP evaluate path sharing the same AST
+- [Evaluate contract](/pyne/docs/api/contract)
+- [Linter](/pyne/docs/core/linter)
+- [Unparser](/pyne/docs/core/unparser)
+- [Editors guide (end user)](/pyne/docs/enduser/guides/editors)

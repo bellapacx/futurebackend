@@ -1,0 +1,5 @@
+// Parity fixture: entry long then exit with limit
+// First fill stays open until the limit hits; same-id entry is not rewritten.
+//@version=5
+strategy.entry("L", strategy.long, qty=10)
+strategy.exit("X", "L", limit=110.0)

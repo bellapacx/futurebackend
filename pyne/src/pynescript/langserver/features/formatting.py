@@ -1,0 +1,194 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Formatting — ``textDocument/formatting``, ``rangeFormatting``, ``onTypeFormatting``.
+
+Public handlers:
+
+- :func:`handle_formatting` — full document via parse + :class:`~pynescript.ast.unparser.NodeUnparser`
+- :func:`handle_range_formatting` — same unparser, edit limited to the requested range
+- :func:`handle_on_type_formatting` — same unparser, edit limited to the just-completed line
+
+Parse failures yield an empty edit list (no throw to the client).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from lsprotocol import types as lsp
+
+
+def handle_formatting(
+    params: lsp.DocumentFormattingParams, source: str | None, tree: Any | None = None
+) -> list[lsp.TextEdit] | None:
+    """Format the whole document; return one replace-edit or ``[]`` if unchanged/error.
+
+    Args:
+        params: Client formatting options (tab size unused; unparser-driven).
+        source: Document text, or ``None``.
+        tree: Pre-parsed AST to reuse instead of re-parsing *source*.
+
+    Returns:
+        List of :class:`~lsprotocol.types.TextEdit`, or empty list on failure.
+    """
+    if not source:
+        return []
+
+    try:
+        from pynescript.ast.helper import parse
+        from pynescript.ast.unparser import NodeUnparser
+
+        if tree is None:
+            tree = parse(source, filename="<format>")
+
+        unparser = NodeUnparser()
+        formatted = unparser.visit(tree)
+
+        if formatted == source:
+            return []
+
+        lines = source.split("\n")
+        end_line = len(lines) - 1
+        end_col = len(lines[-1]) if lines else 0
+
+        return [
+            lsp.TextEdit(
+                range=lsp.Range(
+                    start=lsp.Position(line=0, character=0),
+                    end=lsp.Position(line=end_line, character=end_col),
+                ),
+                new_text=formatted,
+            )
+        ]
+
+    except Exception:
+        return []
+
+
+def handle_range_formatting(
+    params: lsp.DocumentRangeFormattingParams, source: str | None, tree: Any | None = None
+) -> list[lsp.TextEdit] | None:
+    """Format the lines covering *params.range*; return a replace-edit or ``[]``.
+
+    Args:
+        params: Client range + formatting options.
+        source: Document text, or ``None``.
+        tree: Pre-parsed AST to reuse instead of re-parsing *source*.
+
+    Returns:
+        List of :class:`~lsprotocol.types.TextEdit`, or empty list on failure.
+    """
+    if not source:
+        return []
+
+    try:
+        from pynescript.ast.helper import parse
+        from pynescript.ast.unparser import NodeUnparser
+
+        if tree is None:
+            tree = parse(source, filename="<format>")
+
+        unparser = NodeUnparser()
+        formatted = unparser.visit(tree)
+
+        formatted_lines = formatted.split("\n")
+        source_lines = source.split("\n")
+
+        range_start = params.range.start
+        range_end = params.range.end
+
+        in_range = "\n".join(source_lines[range_start.line : range_end.line + 1])
+
+        formatted_in_range = "\n".join(formatted_lines[range_start.line : range_end.line + 1])
+
+        if formatted_in_range == in_range:
+            return []
+
+        return [
+            lsp.TextEdit(
+                range=params.range,
+                new_text=formatted_in_range,
+            )
+        ]
+
+    except Exception:
+        return []
+
+
+def handle_on_type_formatting(
+    params: lsp.DocumentOnTypeFormattingParams,
+    source: str | None,
+    tree: Any | None = ...,
+) -> list[lsp.TextEdit]:
+    """Format the just-completed line after a trigger character.
+
+    After ``\\n``, *params.position* is the cursor on the new line; the
+    previous line (or line 0) is replaced with the corresponding
+    :class:`~pynescript.ast.unparser.NodeUnparser` output when it differs.
+
+    Args:
+        params: Client on-type params (trigger ``ch``, cursor position).
+        source: Document text, or ``None``.
+        tree: Pre-parsed AST from the workspace cache. Pass ``None`` when the
+            workspace already failed to parse (skips a redundant re-parse).
+            Omit (default ``...``) to parse from *source*.
+
+    Returns:
+        Zero or one :class:`~lsprotocol.types.TextEdit` covering only the
+        target source line. Empty list on empty/unparsed source, unknown
+        ``ch``, unchanged line, or error.
+    """
+    if not source or params.ch != "\n" or tree is None:
+        return []
+
+    try:
+        from pynescript.ast.helper import parse
+        from pynescript.ast.unparser import NodeUnparser
+
+        if tree is ...:
+            tree = parse(source, filename="<format>")
+
+        unparser = NodeUnparser()
+        formatted = unparser.visit(tree)
+
+        formatted_lines = formatted.split("\n")
+        source_lines = source.split("\n")
+
+        target = max(0, params.position.line - 1)
+        if target >= len(source_lines) or target >= len(formatted_lines):
+            return []
+
+        source_line = source_lines[target]
+        formatted_line = formatted_lines[target]
+        if formatted_line == source_line:
+            return []
+
+        return [
+            lsp.TextEdit(
+                range=lsp.Range(
+                    start=lsp.Position(line=target, character=0),
+                    end=lsp.Position(line=target, character=len(source_line)),
+                ),
+                new_text=formatted_line,
+            )
+        ]
+
+    except Exception:
+        return []

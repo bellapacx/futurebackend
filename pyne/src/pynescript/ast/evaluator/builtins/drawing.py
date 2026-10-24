@@ -1,0 +1,2736 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Pine drawing builtins: ``line``, ``box``, ``label``, ``table``, ``polyline``.
+
+Provides object types, a process-wide :class:`DrawingRegistry` with reference Pine-
+style garbage-collection caps (``max_lines_count``, …), and
+:class:`DrawingBuiltinsMixin` handlers for ``*.new`` / ``*.set_*`` / ``*.get_*``
+and related APIs. Export helpers produce JSON-safe payloads for host UIs.
+
+Mixin composition
+-----------------
+:class:`DrawingBuiltinsMixin` contributes ``_drawing_builtin_map`` into
+:class:`~pynescript.ast.evaluator.builtins.BuiltinEvaluator`. Caps are applied
+from ``indicator()`` / ``strategy()`` declarations via
+:meth:`DrawingRegistry.configure_from_declaration`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Any
+from typing import ClassVar
+
+from .base import BuiltinDispatchMixin
+from .base import BuiltinHandler
+
+
+# ── export helpers (module-level: no per-call nested-def cost) ──────────────
+
+
+def _export_num(v: Any) -> float | int | None:
+    if v is None:
+        return None
+    if hasattr(v, "current"):
+        v = getattr(v, "current", None)
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and v != v:  # NaN
+            return None
+        return v
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_scalar(v: Any) -> Any:
+    """Freeze a drawing coordinate so it does not track later-bar series.current.
+
+    ``line.new(bar_index, high, …)`` must store *this* bar's high. Leaving a
+    PineSeries / wrapper on the object makes ``export_for_api`` re-read
+    ``.current`` (last bar) and diverge from compile, which snapshots floats.
+    """
+    t = type(v)
+    if v is None or t is int or t is float or t is bool or t is str:
+        return v
+    snapped = _export_num(v)
+    return snapped if snapped is not None else v
+
+
+def _export_x_to_time(x: Any, xloc: str, times: list[int]) -> int | float | None:
+    """Map drawing X to unix seconds (or bare bar_index when times unavailable).
+
+    ``xloc.bar_index`` past the last bar (classic ``bar_index + 1`` on
+    ``barstate.islast``) is extrapolated from the series period so AXIS still
+    receives a finite ``t1``/``t2`` instead of dropping the whole object.
+    """
+    xv = _export_num(x)
+    if xv is None:
+        return None
+    loc = (xloc or "bar_index").lower()
+    if "time" in loc:
+        return xv
+    # already looks like unix seconds / ms (even with bar_index xloc mis-set)
+    if xv > 1_000_000_000:
+        return xv
+    idx = int(xv)
+    n = len(times) if times is not None else 0
+    if n == 0:
+        # No bar clock — pass bar_index through; AXIS paints via logical index
+        return idx
+    if 0 <= idx < n:
+        return times[idx]
+    # Extrapolate past ends (bar_index+1 on last bar is the common TV pattern)
+    if n == 1:
+        period = 60
+    else:
+        period = max(1, int(times[-1]) - int(times[-2]))
+    if idx >= n:
+        return int(times[-1]) + (idx - (n - 1)) * period
+    # idx < 0 → before first bar
+    return int(times[0]) + idx * period
+
+
+def _export_color(c: Any) -> str:
+    if c is None:
+        return "#939fff"
+    if isinstance(c, str) and c:
+        return c
+    if isinstance(c, int):
+        # 0xAARRGGBB or 0xRRGGBB
+        if c > 0xFFFFFF:
+            r = (c >> 16) & 0xFF
+            g = (c >> 8) & 0xFF
+            b = c & 0xFF
+            return f"#{r:02X}{g:02X}{b:02X}"
+        return f"#{c & 0xFFFFFF:06X}"
+    return str(c)
+
+
+def _export_extend(e: Any) -> str:
+    s = str(e or "none").lower().replace("extend.", "").strip()
+    if s in {"none", "left", "right", "both"}:
+        return s
+    return "none"
+
+
+# Pine / reference Pine defaults and hard caps for drawing garbage collection.
+# indicator()/strategy() kwargs: max_lines_count, max_labels_count,
+# max_boxes_count, max_polylines_count (defaults 50; lines/labels/boxes ≤500,
+# polylines ≤100).
+_DEFAULT_DRAWING_LIMIT = 50
+_HARD_CAP_LINES_LABELS_BOXES = 500
+_HARD_CAP_POLYLINES = 100
+
+
+def _clamp_drawing_limit(
+    value: Any,
+    *,
+    default: int = _DEFAULT_DRAWING_LIMIT,
+    hard_cap: int = _HARD_CAP_LINES_LABELS_BOXES,
+) -> int:
+    """Normalize a max_*_count value to ``[1, hard_cap]``."""
+    if value is None:
+        return default
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if n != n:  # NaN
+        return default
+    return max(1, min(hard_cap, n))
+
+
+# Drawing object registries
+class DrawingRegistry:
+    """Global registry for drawing objects.
+
+    Enforces reference Pine-style **garbage collection**: when more drawings of a
+    type exist than the declaration cap (``max_lines_count``, …), the oldest
+    active objects are marked ``deleted=True`` so they leave ``*.all`` and
+    :meth:`export_for_api`.
+    """
+
+    lines: ClassVar[list[Line]] = []
+    boxes: ClassVar[list[Box]] = []
+    labels: ClassVar[list[Label]] = []
+    tables: ClassVar[list[Table]] = []
+    polylines: ClassVar[list[Polyline]] = []
+    linefills: ClassVar[list[LineFill]] = []
+
+    # Active caps (reset to reference defaults on each run)
+    max_lines_count: ClassVar[int] = _DEFAULT_DRAWING_LIMIT
+    max_labels_count: ClassVar[int] = _DEFAULT_DRAWING_LIMIT
+    max_boxes_count: ClassVar[int] = _DEFAULT_DRAWING_LIMIT
+    max_polylines_count: ClassVar[int] = _DEFAULT_DRAWING_LIMIT
+
+    @classmethod
+    def reset(cls) -> None:
+        """Reset all registries for testing / start of a run."""
+        cls.lines = []
+        cls.boxes = []
+        cls.labels = []
+        cls.tables = []
+        cls.polylines = []
+        cls.linefills = []
+        cls.max_lines_count = _DEFAULT_DRAWING_LIMIT
+        cls.max_labels_count = _DEFAULT_DRAWING_LIMIT
+        cls.max_boxes_count = _DEFAULT_DRAWING_LIMIT
+        cls.max_polylines_count = _DEFAULT_DRAWING_LIMIT
+        # Also reset plot real effects
+        from .plotting import PlotRegistry
+
+        PlotRegistry.reset()
+
+    @classmethod
+    def configure_limits(
+        cls,
+        *,
+        max_lines_count: Any = None,
+        max_labels_count: Any = None,
+        max_boxes_count: Any = None,
+        max_polylines_count: Any = None,
+    ) -> None:
+        """Set GC caps (None keeps the current value for that type)."""
+        if max_lines_count is not None:
+            cls.max_lines_count = _clamp_drawing_limit(max_lines_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES)
+        if max_labels_count is not None:
+            cls.max_labels_count = _clamp_drawing_limit(max_labels_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES)
+        if max_boxes_count is not None:
+            cls.max_boxes_count = _clamp_drawing_limit(max_boxes_count, hard_cap=_HARD_CAP_LINES_LABELS_BOXES)
+        if max_polylines_count is not None:
+            cls.max_polylines_count = _clamp_drawing_limit(max_polylines_count, hard_cap=_HARD_CAP_POLYLINES)
+        # If caps shrank, immediately collect
+        cls.gc_all()
+
+    @classmethod
+    def configure_from_declaration(cls, decl: Any) -> None:
+        """Apply ``indicator()`` / ``strategy()`` max_*_count from ScriptDeclaration."""
+        if decl is None:
+            return
+        kw = getattr(decl, "kwargs", None) or {}
+        if not isinstance(kw, dict):
+            kw = {}
+
+        def _pick(name: str) -> Any:
+            v = getattr(decl, name, None)
+            if v is not None:
+                return v
+            return kw.get(name)
+
+        # Only override when the declaration provided a value (else keep defaults
+        # from reset). ``configure_limits`` treats None as "leave current".
+        lines = _pick("max_lines_count")
+        labels = _pick("max_labels_count")
+        boxes = _pick("max_boxes_count")
+        polylines = _pick("max_polylines_count")
+        cls.configure_limits(
+            max_lines_count=lines if lines is not None else cls.max_lines_count,
+            max_labels_count=labels if labels is not None else cls.max_labels_count,
+            max_boxes_count=boxes if boxes is not None else cls.max_boxes_count,
+            max_polylines_count=polylines if polylines is not None else cls.max_polylines_count,
+        )
+
+    @classmethod
+    def limits_dict(cls) -> dict[str, int]:
+        """JSON-safe caps for API ``meta`` (AXIS client GC)."""
+        return {
+            "max_lines_count": int(cls.max_lines_count),
+            "max_labels_count": int(cls.max_labels_count),
+            "max_boxes_count": int(cls.max_boxes_count),
+            "max_polylines_count": int(cls.max_polylines_count),
+        }
+
+    @classmethod
+    def _gc_collection(cls, items: list[Any], limit: int) -> None:
+        """Mark oldest non-deleted objects as deleted when over *limit*."""
+        cap = limit if isinstance(limit, int) and limit > 0 else _DEFAULT_DRAWING_LIMIT
+        n_active = 0
+        for obj in items:
+            if not getattr(obj, "deleted", False):
+                n_active += 1
+        excess = n_active - cap
+        if excess <= 0:
+            return
+        for obj in items:
+            if excess <= 0:
+                break
+            if not getattr(obj, "deleted", False):
+                obj.deleted = True
+                excess -= 1
+
+    @classmethod
+    def gc_all(cls) -> None:
+        """Run GC on all capped collections (lines/labels/boxes/polylines)."""
+        cls._gc_collection(cls.lines, cls.max_lines_count)
+        cls._gc_collection(cls.labels, cls.max_labels_count)
+        cls._gc_collection(cls.boxes, cls.max_boxes_count)
+        cls._gc_collection(cls.polylines, cls.max_polylines_count)
+
+    @classmethod
+    def add_line(cls, line: Line) -> Line:
+        cls.lines.append(line)
+        cls._gc_collection(cls.lines, cls.max_lines_count)
+        return line
+
+    @classmethod
+    def add_box(cls, box: Box) -> Box:
+        cls.boxes.append(box)
+        cls._gc_collection(cls.boxes, cls.max_boxes_count)
+        return box
+
+    @classmethod
+    def add_label(cls, label: Label) -> Label:
+        cls.labels.append(label)
+        cls._gc_collection(cls.labels, cls.max_labels_count)
+        return label
+
+    @classmethod
+    def add_polyline(cls, polyline: Polyline) -> Polyline:
+        cls.polylines.append(polyline)
+        cls._gc_collection(cls.polylines, cls.max_polylines_count)
+        return polyline
+
+    @classmethod
+    def add_table(cls, table: Table) -> Table:
+        """Tables are not GC-capped by max_*_count (reference uses a separate limit)."""
+        cls.tables.append(table)
+        return table
+
+    @classmethod
+    def add_linefill(cls, fill: LineFill) -> LineFill:
+        cls.linefills.append(fill)
+        return fill
+
+    @classmethod
+    def merge_visual_series_from_drawings(
+        cls,
+        series: dict[str, list[Any]],
+        drawings: list[dict[str, Any]] | list[Any] | None,
+        n_bars: int,
+        *,
+        plot_meta: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, list[Any]]:
+        """Lift bgcolor/plotshape/plotchar/plotarrow events into *series* keys.
+
+        Thin wrapper around :func:`plotting.materialize_visual_series_from_drawings`
+        for Runtime compile packing (interpret already exports these via
+        columnar plot capture). Does not overwrite existing series keys.
+        """
+        from .plotting import merge_visual_series_from_drawings as _merge
+
+        return _merge(series, drawings, n_bars, plot_meta=plot_meta)
+
+    @classmethod
+    def fold_compile_drawing_mutations(
+        cls,
+        drawings: list[dict[str, Any]] | list[Any] | None,
+    ) -> list[Any]:
+        """Apply compile-path ``kind: set`` / ``kind: delete`` onto ``target`` handles.
+
+        Object-mode compile appends ``line.set_*`` / ``label.set_*`` / … and
+        ``line.delete`` / … as separate events; the original ``line``/``label``/…
+        dict is still the live handle. Fold mutations in-process (shared identity)
+        then drop set/delete events so AXIS receives final geometry only.
+
+        Deletes: dedicated ``kind: 'delete'`` (compiler ``*_delete`` emitters) or
+        a set event whose method ends with ``.delete`` / ``_delete``.
+        """
+        if not drawings:
+            return []
+        deleted_ids: set[int] = set()
+        for item in drawings:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or item.get("type") or "").lower()
+            if kind == "delete":
+                target = item.get("target")
+                if isinstance(target, dict):
+                    deleted_ids.add(id(target))
+                    target["deleted"] = True
+                continue
+            if kind != "set":
+                continue
+            target = item.get("target")
+            if not isinstance(target, dict):
+                continue
+            method = str(item.get("method") or "")
+            args = item.get("args") if isinstance(item.get("args"), list) else []
+            # method is e.g. "line.set_xy2" or "line_set_xy2"
+            bare = method.replace("line_set_", "line.set_").replace("label_set_", "label.set_")
+            bare = bare.replace("box_set_", "box.set_").replace("polyline_set_", "polyline.set_")
+            bare = bare.replace("table_set_", "table.set_")
+            mlow = bare.lower()
+            if mlow.endswith(".delete") or mlow.endswith("_delete"):
+                deleted_ids.add(id(target))
+                target["deleted"] = True
+                continue
+            # table.cell(table_id, column, row, text, …) / table.cell_set_*
+            cell_method = method.lower().replace("table_cell_set_", "table.cell_set_")
+            cell_method = cell_method.replace("table_cell", "table.cell")
+            if cell_method == "table.cell" or "cell_set_" in cell_method:
+                cells = target.get("cells")
+                if not isinstance(cells, list):
+                    cells = []
+                    target["cells"] = cells
+
+                def _cell_int(v: Any, default: int = 0) -> int:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        return default
+
+                col = _cell_int(args[0] if len(args) > 0 else item.get("column", item.get("col", 0)))
+                row = _cell_int(args[1] if len(args) > 1 else item.get("row", 0))
+                cell: dict[str, Any] | None = None
+                for existing in cells:
+                    if not isinstance(existing, dict):
+                        continue
+                    if (
+                        _cell_int(existing.get("row", 0)) == row
+                        and _cell_int(existing.get("col", existing.get("column", 0))) == col
+                    ):
+                        cell = existing
+                        break
+                if cell is None:
+                    cell = {"row": row, "col": col, "text": ""}
+                    cells.append(cell)
+                if cell_method == "table.cell":
+                    text = args[2] if len(args) > 2 else item.get("text")
+                    if text is not None:
+                        cell["text"] = str(text)
+                    text_color = item.get("text_color")
+                    # Compile rest args omit table_id: text=2, text_color=5, bgcolor=9.
+                    if text_color is None and len(args) > 5:
+                        text_color = args[5]
+                    if text_color is not None:
+                        cell["text_color"] = text_color
+                    bgcolor = item.get("bgcolor")
+                    if bgcolor is None and len(args) > 9:
+                        bgcolor = args[9]
+                    if bgcolor is not None:
+                        cell["bgcolor"] = bgcolor
+                else:
+                    field = cell_method.split("cell_set_", 1)[-1]
+                    val = args[2] if len(args) > 2 else item.get(field)
+                    if val is not None:
+                        cell["text" if field == "text" else field] = str(val) if field == "text" else val
+                continue
+            field = bare.split(".")[-1] if "." in bare else bare
+            field = field.replace("set_", "")
+            # Common mutators
+            if field == "xy1" and len(args) >= 2:
+                target["x1"] = args[0]
+                target["y1"] = args[1]
+                target["x"] = args[0]
+                target["y"] = args[1]
+            elif field == "xy2" and len(args) >= 2:
+                target["x2"] = args[0]
+                target["y2"] = args[1]
+            elif field in {"x1", "y1", "x2", "y2", "left", "right", "top", "bottom", "x", "y"}:
+                if args:
+                    target[field] = args[0]
+            elif field == "color" and args:
+                target["color"] = args[0]
+            elif field in {"width", "linewidth"} and args:
+                target["width"] = args[0]
+            elif field == "extend" and args:
+                target["extend"] = args[0]
+            elif field in {"style", "text", "textcolor", "text_color", "bgcolor"} and args:
+                key = "textcolor" if field == "text_color" else field
+                target[key] = args[0]
+            elif field == "xy" and len(args) >= 2:
+                # label.set_xy
+                target["x"] = args[0]
+                target["y"] = args[1]
+            elif args:
+                # Generic: first arg is the new value for set_<field>
+                target[field] = args[0]
+
+        out: list[Any] = []
+        for item in drawings:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or item.get("type") or "").lower()
+            if kind in ("set", "delete"):
+                continue
+            if item.get("deleted") or id(item) in deleted_ids:
+                continue
+            out.append(item)
+        return out
+
+    @classmethod
+    def gc_exported_drawings(
+        cls,
+        drawings: list[dict[str, Any]] | list[Any],
+        limits: dict[str, int] | None = None,
+    ) -> list[Any]:
+        """Post-process a compile-path ``__drawings`` list (keep last N per type).
+
+        Geometry kinds map to the same caps as the interpret registry. Non-
+        geometry events (bgcolor, plotshape, table, …) are preserved.
+        """
+        if not drawings:
+            return drawings
+        lim = limits or cls.limits_dict()
+
+        def _bucket(kind: str) -> str | None:
+            k = kind.lower().replace("drawing.", "")
+            if k in ("line", "trend", "ray", "segment", "hline", "horizontalline", "horizontal_line"):
+                return "line"
+            if k in ("box", "rect", "rectangle"):
+                return "box"
+            if k in ("label", "text"):
+                return "label"
+            if k == "polyline":
+                return "polyline"
+            return None
+
+        counts: dict[str, int] = {"line": 0, "box": 0, "label": 0, "polyline": 0}
+        kinds: list[str | None] = []
+        for item in drawings:
+            if not isinstance(item, dict):
+                kinds.append(None)
+                continue
+            raw = str(item.get("type") or item.get("kind") or "")
+            b = _bucket(raw)
+            kinds.append(b)
+            if b is not None:
+                counts[b] += 1
+
+        skip = {
+            "line": max(0, counts["line"] - int(lim.get("max_lines_count", _DEFAULT_DRAWING_LIMIT))),
+            "box": max(0, counts["box"] - int(lim.get("max_boxes_count", _DEFAULT_DRAWING_LIMIT))),
+            "label": max(0, counts["label"] - int(lim.get("max_labels_count", _DEFAULT_DRAWING_LIMIT))),
+            "polyline": max(0, counts["polyline"] - int(lim.get("max_polylines_count", _DEFAULT_DRAWING_LIMIT))),
+        }
+        if not any(skip.values()):
+            return drawings
+
+        seen = {"line": 0, "box": 0, "label": 0, "polyline": 0}
+        out: list[Any] = []
+        for item, b in zip(drawings, kinds, strict=True):
+            if b is None:
+                out.append(item)
+                continue
+            n = seen[b]
+            seen[b] = n + 1
+            if n < skip[b]:
+                continue
+            out.append(item)
+        return out
+
+    @classmethod
+    def is_empty(cls) -> bool:
+        """True when no *exportable* drawing objects exist (O(1) length checks).
+
+        Used by Runtime to skip ``export_for_api`` and bar_times materialization.
+        """
+        # truthiness of a list is len != 0 — no iteration
+        return not (cls.lines or cls.boxes or cls.labels or cls.tables or cls.polylines or cls.linefills)
+
+    @classmethod
+    def export_for_api(cls, bar_times: list[int] | None = None) -> list[dict[str, Any]]:
+        """Serialize active drawing objects for the Pro API / AXIS chart.
+
+        ``bar_times`` maps ``xloc=bar_index`` coordinates to unix seconds.
+
+        Fast path: empty registry returns ``[]`` without allocating helpers or
+        walking collections (most indicator scripts never draw).
+        """
+        if not (cls.lines or cls.boxes or cls.labels or cls.tables or cls.polylines or cls.linefills):
+            return []
+
+        out: list[dict[str, Any]] = []
+        times = bar_times if bar_times is not None else []
+        _num = _export_num
+        _x_to_time = _export_x_to_time
+        _color = _export_color
+        _extend = _export_extend
+
+        for ln in cls.lines:
+            if getattr(ln, "deleted", False):
+                continue
+            xloc = str(getattr(ln, "xloc", "bar_index") or "bar_index")
+            # Guard mis-merged kwargs (color hex landed in xloc)
+            if xloc.startswith("#") or xloc.startswith("rgb"):
+                xloc = "bar_index"
+            t1 = _x_to_time(ln.x1, xloc, times)
+            t2 = _x_to_time(ln.x2, xloc, times)
+            y1 = _num(ln.y1)
+            y2 = _num(ln.y2)
+            if t1 is None or t2 is None or y1 is None or y2 is None:
+                continue
+            out.append(
+                {
+                    "type": "line",
+                    "t1": t1,
+                    "p1": y1,
+                    "t2": t2,
+                    "p2": y2,
+                    "color": _color(ln.color),
+                    "width": int(_num(ln.width) or 1),
+                    "style": str(ln.style or "solid"),
+                    "extend": _extend(ln.extend),
+                    "force_overlay": bool(getattr(ln, "force_overlay", False)),
+                }
+            )
+
+        for bx in cls.boxes:
+            if getattr(bx, "deleted", False):
+                continue
+            xloc = str(getattr(bx, "xloc", "bar_index") or "bar_index")
+            if xloc.startswith("#") or xloc.startswith("rgb"):
+                xloc = "bar_index"
+            t1 = _x_to_time(bx.left, xloc, times)
+            t2 = _x_to_time(bx.right, xloc, times)
+            top = _num(bx.top)
+            bottom = _num(bx.bottom)
+            if t1 is None or t2 is None or top is None or bottom is None:
+                continue
+            out.append(
+                {
+                    "type": "box",
+                    "t1": t1,
+                    "p1": top,
+                    "t2": t2,
+                    "p2": bottom,
+                    "color": _color(bx.border_color),
+                    "bgcolor": _color(bx.bgcolor) if bx.bgcolor else "rgba(0,0,0,0)",
+                    "width": int(_num(bx.border_width) or 1),
+                    "text": str(bx.text or ""),
+                    "force_overlay": bool(getattr(bx, "force_overlay", False)),
+                    "extend": _extend(bx.extend),
+                    "border_style": str(bx.border_style or "solid"),
+                    "text_color": _color(bx.text_color),
+                    "text_halign": str(bx.text_halign or "center"),
+                    "text_valign": str(bx.text_valign or "center"),
+                    "text_size": bx.text_size if isinstance(bx.text_size, (int, float)) else str(bx.text_size),
+                    "text_wrap": str(bx.text_wrap or "none"),
+                    "text_font_family": str(bx.text_font_family or "default"),
+                }
+            )
+
+        for lb in cls.labels:
+            if getattr(lb, "deleted", False):
+                continue
+            xloc = str(getattr(lb, "xloc", "bar_index") or "bar_index")
+            if xloc.startswith("#") or xloc.startswith("rgb"):
+                xloc = "bar_index"
+            t = _x_to_time(lb.x, xloc, times)
+            y = _num(lb.y)
+            if t is None or y is None:
+                continue
+            size_raw = getattr(lb, "size", None)
+            if size_raw is None or size_raw in {"", "auto"}:
+                size_raw = getattr(lb, "text_size", None) or "auto"
+            yloc_raw = str(getattr(lb, "yloc", None) or "price")
+            if yloc_raw.startswith("#") or yloc_raw.startswith("rgb"):
+                yloc_raw = "price"
+            out.append(
+                {
+                    "type": "label",
+                    "force_overlay": bool(getattr(lb, "force_overlay", False)),
+                    "t1": t,
+                    "p1": y,
+                    "text": str(lb.text or ""),
+                    "color": _color(lb.color),
+                    "textcolor": _color(lb.textcolor),
+                    "style": str(lb.style or "label_center"),
+                    "yloc": yloc_raw,
+                    "size": size_raw if isinstance(size_raw, (int, float)) else str(size_raw),
+                    "tooltip": str(getattr(lb, "tooltip", "") or ""),
+                    "text_halign": str(lb.text_halign or "center"),
+                    "text_valign": str(lb.text_valign or "center"),
+                    "text_font_family": str(lb.text_font_family or "default"),
+                    "text_formatting": str(lb.text_formatting or ""),
+                }
+            )
+
+        for pl in cls.polylines:
+            if getattr(pl, "deleted", False):
+                continue
+            xloc = str(getattr(pl, "xloc", "bar_index") or "bar_index")
+            pts_out: list[dict[str, float | int]] = []
+            for pt in getattr(pl, "points", None) or []:
+                # ChartPoint: time / index / price
+                price = _num(getattr(pt, "price", None))
+                if price is None:
+                    continue
+                if getattr(pt, "time", None) is not None:
+                    t = _num(pt.time)
+                elif getattr(pt, "index", None) is not None:
+                    t = _x_to_time(pt.index, xloc, times)
+                else:
+                    t = None
+                if t is None:
+                    continue
+                pts_out.append({"time": t, "price": price})
+            if len(pts_out) < 2:
+                continue
+            pl_extra: dict[str, Any] = {}
+            fill_c = getattr(pl, "fill_color", None)
+            if fill_c:
+                pl_extra["fill_color"] = _color(fill_c)
+            out.append(
+                {
+                    "type": "polyline",
+                    "points": pts_out,
+                    "closed": bool(getattr(pl, "closed", False)),
+                    "color": _color(pl.color),
+                    "width": int(_num(pl.width) or 1),
+                    "style": str(pl.style or "solid"),
+                    "curved": bool(getattr(pl, "curved", False)),
+                    "force_overlay": bool(getattr(pl, "force_overlay", False)),
+                    **pl_extra,
+                    "t1": pts_out[0]["time"],
+                    "p1": pts_out[0]["price"],
+                    "t2": pts_out[-1]["time"],
+                    "p2": pts_out[-1]["price"],
+                }
+            )
+
+        # linefill.new — fill between two Line objects (quad for AXIS SVG)
+        for fill in cls.linefills:
+            if getattr(fill, "deleted", False):
+                continue
+            l1 = getattr(fill, "line1", None)
+            l2 = getattr(fill, "line2", None)
+            if l1 is None or l2 is None:
+                continue
+            if getattr(l1, "deleted", False) or getattr(l2, "deleted", False):
+                continue
+            xloc1 = str(getattr(l1, "xloc", "bar_index") or "bar_index")
+            xloc2 = str(getattr(l2, "xloc", "bar_index") or "bar_index")
+            if xloc1.startswith("#") or xloc1.startswith("rgb"):
+                xloc1 = "bar_index"
+            if xloc2.startswith("#") or xloc2.startswith("rgb"):
+                xloc2 = "bar_index"
+            t1 = _x_to_time(l1.x1, xloc1, times)
+            t2 = _x_to_time(l1.x2, xloc1, times)
+            p1 = _num(l1.y1)
+            p2 = _num(l1.y2)
+            t3 = _x_to_time(l2.x1, xloc2, times)
+            t4 = _x_to_time(l2.x2, xloc2, times)
+            p3 = _num(l2.y1)
+            p4 = _num(l2.y2)
+            if None in (t1, t2, p1, p2, t3, t4, p3, p4):
+                continue
+            out.append(
+                {
+                    "type": "linefill",
+                    "t1": t1,
+                    "p1": p1,
+                    "t2": t2,
+                    "p2": p2,
+                    "t3": t3,
+                    "p3": p3,
+                    "t4": t4,
+                    "p4": p4,
+                    "color": _color(getattr(fill, "color", None)),
+                    # AXIS / SVG fill; stroke unused
+                    "bgcolor": _color(getattr(fill, "color", None)),
+                }
+            )
+
+        # Tables are UI overlays (not price-scale geometry) — emit metadata only
+        for tb in cls.tables:
+            if getattr(tb, "deleted", False):
+                continue
+            cells: list[dict[str, Any]] = []
+            for (row, col), cell in (getattr(tb, "cells", None) or {}).items():
+                cell_out: dict[str, Any] = {
+                    "row": row,
+                    "col": col,
+                    "text": str(getattr(cell, "text", "") or ""),
+                    "text_color": _color(getattr(cell, "text_color", "#000000")),
+                    "bgcolor": _color(getattr(cell, "bgcolor", "rgba(255,255,255,255)")),
+                    "text_halign": str(getattr(cell, "text_halign", "center") or "center"),
+                    "text_valign": str(getattr(cell, "text_valign", "center") or "center"),
+                    "text_size": getattr(cell, "text_size", "auto") or "auto",
+                    "tooltip": str(getattr(cell, "tooltip", "") or ""),
+                }
+                width = getattr(cell, "width", None)
+                height = getattr(cell, "height", None)
+                if width is not None:
+                    cell_out["width"] = width
+                if height is not None:
+                    cell_out["height"] = height
+                cells.append(cell_out)
+            pos = str(getattr(tb, "position", "top_right") or "top_right")
+            pos = pos.replace("position.", "")
+            out.append(
+                {
+                    "type": "table",
+                    "position": pos,
+                    "rows": int(getattr(tb, "rows", 0) or 0),
+                    "columns": int(getattr(tb, "columns", 0) or 0),
+                    "cells": cells,
+                    "frame_color": _color(getattr(tb, "frame_color", "#000000")),
+                    "frame_width": int(getattr(tb, "frame_width", 1) or 1),
+                    "border_color": _color(getattr(tb, "border_color", "#000000")),
+                    "border_width": int(getattr(tb, "border_width", 1) or 1),
+                    "bgcolor": _color(getattr(tb, "bgcolor", "rgba(255,255,255,255)")),
+                    "force_overlay": bool(getattr(tb, "force_overlay", False)),
+                    "merged_cells": [[m[0], m[1], m[2], m[3]] for m in getattr(tb, "merged", ())],
+                    "t1": 0,
+                    "p1": 0,
+                    "color": _color(getattr(tb, "frame_color", "#000000")),
+                }
+            )
+
+        return out
+
+    # Compile ``__drawings`` kinds that are plot/visual events, not geometry.
+    # Interpret ``export_for_api`` never emits these (they live in series).
+    _COMPILE_VISUAL_KINDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "hline",
+            "fill",
+            "bgcolor",
+            "barcolor",
+            "plotshape",
+            "plotchar",
+            "plotarrow",
+            "plotbar",
+            "plotcandle",
+            "plot",
+        }
+    )
+
+    @classmethod
+    def export_compile_events_for_api(
+        cls,
+        events: list[dict[str, Any]] | list[Any] | None,
+        bar_times: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Normalize folded compile drawing events to interpret ``export_for_api`` shape.
+
+        Drops visual/plot events (hline / fill / bgcolor / plotshape / …) so
+        Runtime ``drawings`` is geometry-only on both hosts. AXIS fields
+        (``type``, ``t1``, ``p1``, …) use the same bar-index → time mapping.
+        """
+        if not events:
+            return []
+        times = bar_times if bar_times is not None else []
+        _num = _export_num
+        _x_to_time = _export_x_to_time
+        _color = _export_color
+        _extend = _export_extend
+        out: list[dict[str, Any]] = []
+
+        def _xloc_of(item: dict[str, Any]) -> str:
+            xloc = str(item.get("xloc") or "bar_index")
+            if xloc.startswith("#") or xloc.startswith("rgb"):
+                return "bar_index"
+            return xloc.replace("xloc.", "") or "bar_index"
+
+        def _point_pair(pt: Any) -> tuple[Any, Any] | None:
+            if pt is None:
+                return None
+            if isinstance(pt, dict):
+                price = _num(pt.get("price", pt.get("y")))
+                if price is None:
+                    return None
+                if pt.get("time") is not None and _num(pt.get("time")) is not None:
+                    t = _num(pt.get("time"))
+                elif pt.get("index") is not None:
+                    t = _x_to_time(pt.get("index"), "bar_index", times)
+                elif pt.get("x") is not None:
+                    t = _x_to_time(pt.get("x"), "bar_index", times)
+                else:
+                    t = None
+                if t is None:
+                    return None
+                return t, price
+            price = _num(getattr(pt, "price", None))
+            if price is None:
+                return None
+            if getattr(pt, "time", None) is not None:
+                t = _num(pt.time)
+            elif getattr(pt, "index", None) is not None:
+                t = _x_to_time(pt.index, "bar_index", times)
+            else:
+                t = None
+            if t is None:
+                return None
+            return t, price
+
+        for item in events:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or item.get("kind") or "").lower()
+            if kind in cls._COMPILE_VISUAL_KINDS or kind in ("set", "delete"):
+                continue
+            if item.get("deleted"):
+                continue
+
+            if kind == "line":
+                xloc = _xloc_of(item)
+                t1 = _x_to_time(item.get("x1"), xloc, times)
+                t2 = _x_to_time(item.get("x2"), xloc, times)
+                y1 = _num(item.get("y1"))
+                y2 = _num(item.get("y2"))
+                if t1 is None or t2 is None or y1 is None or y2 is None:
+                    continue
+                out.append(
+                    {
+                        "type": "line",
+                        "t1": t1,
+                        "p1": y1,
+                        "t2": t2,
+                        "p2": y2,
+                        "color": _color(item.get("color") or "#000000"),
+                        "width": int(_num(item.get("width")) or 1),
+                        "style": str(item.get("style") or "solid").replace("line.style_", ""),
+                        "extend": _extend(item.get("extend")),
+                        "force_overlay": bool(item.get("force_overlay", False)),
+                    }
+                )
+                continue
+
+            if kind == "box":
+                xloc = _xloc_of(item)
+                t1 = _x_to_time(item.get("left"), xloc, times)
+                t2 = _x_to_time(item.get("right"), xloc, times)
+                top = _num(item.get("top"))
+                bottom = _num(item.get("bottom"))
+                if t1 is None or t2 is None or top is None or bottom is None:
+                    continue
+                border = item.get("border_color", item.get("color"))
+                out.append(
+                    {
+                        "type": "box",
+                        "t1": t1,
+                        "p1": top,
+                        "t2": t2,
+                        "p2": bottom,
+                        "color": _color(border),
+                        "bgcolor": _color(item.get("bgcolor")) if item.get("bgcolor") else "rgba(0,0,0,0)",
+                        "width": int(_num(item.get("border_width", item.get("width"))) or 1),
+                        "text": str(item.get("text") or ""),
+                        "force_overlay": bool(item.get("force_overlay", False)),
+                        "extend": _extend(item.get("extend")),
+                        "border_style": str(item.get("border_style", item.get("borderStyle", "solid")) or "solid"),
+                        "text_color": _color(item.get("text_color", item.get("textColor", "#000000"))),
+                        "text_halign": str(item.get("text_halign", item.get("halign", "center")) or "center"),
+                        "text_valign": str(item.get("text_valign", item.get("valign", "center")) or "center"),
+                        "text_size": item.get("text_size", item.get("textSize", "auto")) or "auto",
+                        "text_wrap": str(item.get("text_wrap", item.get("textWrap", "none")) or "none"),
+                        "text_font_family": str(
+                            item.get("text_font_family", item.get("fontFamily", "default")) or "default"
+                        ),
+                    }
+                )
+                continue
+
+            if kind == "label":
+                xloc = _xloc_of(item)
+                t = _x_to_time(item.get("x"), xloc, times)
+                y = _num(item.get("y"))
+                if t is None or y is None:
+                    continue
+                size_raw = item.get("size", item.get("text_size"))
+                if size_raw is None or size_raw in {"", "auto"}:
+                    size_raw = "auto"
+                yloc_raw = str(item.get("yloc") or "price")
+                if yloc_raw.startswith("#") or yloc_raw.startswith("rgb"):
+                    yloc_raw = "price"
+                out.append(
+                    {
+                        "type": "label",
+                        "force_overlay": bool(item.get("force_overlay", False)),
+                        "t1": t,
+                        "p1": y,
+                        "text": str(item.get("text") or ""),
+                        "color": _color(item.get("color") or "#000000"),
+                        "textcolor": _color(item.get("textcolor", item.get("text_color")) or "#000000"),
+                        "style": str(item.get("style") or "label_center"),
+                        "yloc": yloc_raw,
+                        "size": size_raw if isinstance(size_raw, (int, float)) else str(size_raw),
+                        "tooltip": str(item.get("tooltip") or ""),
+                        "text_halign": str(item.get("text_halign", item.get("halign", "center")) or "center"),
+                        "text_valign": str(item.get("text_valign", item.get("valign", "center")) or "center"),
+                        "text_font_family": str(
+                            item.get("text_font_family", item.get("fontFamily", "default")) or "default"
+                        ),
+                        "text_formatting": str(item.get("text_formatting", item.get("formatting", "")) or ""),
+                    }
+                )
+                continue
+
+            if kind == "polyline":
+                xloc = _xloc_of(item)
+                raw_pts = item.get("points", item.get("arg0"))
+                pts_out: list[dict[str, float | int]] = []
+                if isinstance(raw_pts, list):
+                    for pt in raw_pts:
+                        pair = _point_pair(pt)
+                        if pair is not None:
+                            pts_out.append({"time": pair[0], "price": pair[1]})
+                if len(pts_out) < 2:
+                    continue
+                closed = item.get("closed", item.get("arg1", False))
+                out.append(
+                    {
+                        "type": "polyline",
+                        "points": pts_out,
+                        "closed": bool(closed),
+                        "color": _color(item.get("color") or "#000000"),
+                        "width": int(_num(item.get("width")) or 1),
+                        "style": str(item.get("style") or "solid"),
+                        "curved": bool(item.get("curved", False)),
+                        "force_overlay": bool(item.get("force_overlay", item.get("forceOverlay", False))),
+                        "t1": pts_out[0]["time"],
+                        "p1": pts_out[0]["price"],
+                        "t2": pts_out[-1]["time"],
+                        "p2": pts_out[-1]["price"],
+                    }
+                )
+                if item.get("fill_color"):
+                    out[-1]["fill_color"] = _color(item.get("fill_color"))
+                continue
+
+            if kind == "linefill":
+                l1 = item.get("line1", item.get("arg0"))
+                l2 = item.get("line2", item.get("arg1"))
+                if not isinstance(l1, dict) or not isinstance(l2, dict):
+                    continue
+                if l1.get("deleted") or l2.get("deleted"):
+                    continue
+                xloc1 = _xloc_of(l1)
+                xloc2 = _xloc_of(l2)
+                t1 = _x_to_time(l1.get("x1"), xloc1, times)
+                t2 = _x_to_time(l1.get("x2"), xloc1, times)
+                p1 = _num(l1.get("y1"))
+                p2 = _num(l1.get("y2"))
+                t3 = _x_to_time(l2.get("x1"), xloc2, times)
+                t4 = _x_to_time(l2.get("x2"), xloc2, times)
+                p3 = _num(l2.get("y1"))
+                p4 = _num(l2.get("y2"))
+                if None in (t1, t2, p1, p2, t3, t4, p3, p4):
+                    continue
+                fill_color = item.get("color")
+                out.append(
+                    {
+                        "type": "linefill",
+                        "t1": t1,
+                        "p1": p1,
+                        "t2": t2,
+                        "p2": p2,
+                        "t3": t3,
+                        "p3": p3,
+                        "t4": t4,
+                        "p4": p4,
+                        "color": _color(fill_color),
+                        "bgcolor": _color(fill_color),
+                    }
+                )
+                continue
+
+            if kind == "table":
+                pos = str(item.get("position", item.get("arg0", "top_right")) or "top_right")
+                pos = pos.replace("position.", "")
+                rows = item.get("rows", item.get("arg1", 0))
+                cols = item.get("columns", item.get("arg2", 0))
+                try:
+                    rows_i = int(rows or 0)
+                except (TypeError, ValueError):
+                    rows_i = 0
+                try:
+                    cols_i = int(cols or 0)
+                except (TypeError, ValueError):
+                    cols_i = 0
+                cells_raw = item.get("cells") or []
+                cells: list[dict[str, Any]] = []
+                if isinstance(cells_raw, list):
+                    for cell in cells_raw:
+                        if isinstance(cell, dict):
+                            cell_out: dict[str, Any] = {
+                                "row": cell.get("row", 0),
+                                "col": cell.get("col", cell.get("column", 0)),
+                                "text": str(cell.get("text") or ""),
+                                "text_color": _color(cell.get("text_color", cell.get("textColor", "#000000"))),
+                                "bgcolor": _color(cell.get("bgcolor", "rgba(255,255,255,255)")),
+                                "text_halign": str(cell.get("text_halign", cell.get("halign", "center")) or "center"),
+                                "text_valign": str(cell.get("text_valign", cell.get("valign", "center")) or "center"),
+                                "text_size": cell.get("text_size", cell.get("textSize", "auto")) or "auto",
+                                "tooltip": str(cell.get("tooltip") or ""),
+                            }
+                            if cell.get("width") is not None:
+                                cell_out["width"] = cell.get("width")
+                            if cell.get("height") is not None:
+                                cell_out["height"] = cell.get("height")
+                            cells.append(cell_out)
+                frame = item.get("frame_color", item.get("color", "#000000"))
+                out.append(
+                    {
+                        "type": "table",
+                        "position": pos,
+                        "rows": rows_i,
+                        "columns": cols_i,
+                        "cells": cells,
+                        "frame_color": _color(frame),
+                        "frame_width": int(item.get("frame_width", item.get("frameWidth", 1)) or 1),
+                        "border_color": _color(item.get("border_color", item.get("borderColor", "#000000"))),
+                        "border_width": int(item.get("border_width", item.get("borderWidth", 1)) or 1),
+                        "bgcolor": _color(item.get("bgcolor", "rgba(255,255,255,255)")),
+                        "force_overlay": bool(item.get("force_overlay", item.get("forceOverlay", False))),
+                        "merged_cells": list(item.get("merged_cells", item.get("mergedCells", [])) or []),
+                        "t1": 0,
+                        "p1": 0,
+                        "color": _color(frame),
+                    }
+                )
+
+        return out
+
+
+@dataclass
+class Line:
+    """Segment between two chart points (``line.new`` / ``line.set_*``)."""
+
+    x1: int | float
+    y1: float
+    x2: int | float
+    y2: float
+    xloc: str = "bar_index"  # "bar_index" or "time"
+    color: str = "#000000"
+    width: int = 1
+    style: str = "solid"  # "solid", "dashed", "dotted"
+    extend: str = "none"  # "none", "left", "right", "both"
+    force_overlay: bool = False  # v6
+    deleted: bool = False
+
+
+@dataclass
+class Box:
+    """Axis-aligned rectangle on the chart (``box.new`` / ``box.set_*``)."""
+
+    left: int | float
+    top: float
+    right: int | float
+    bottom: float
+    xloc: str = "bar_index"
+    closed: bool = True
+    bgcolor: str = "rgba(0,0,0,0)"
+    border_color: str = "#000000"
+    border_width: int = 1
+    border_style: str = "solid"
+    extend: str = "none"
+    text: str = ""
+    text_color: str = "#000000"
+    text_font_family: str = "default"
+    text_halign: str = "center"
+    text_valign: str = "center"
+    text_size: int | str = "auto"
+    text_formatting: str = ""
+    text_wrap: str = "none"
+    force_overlay: bool = False  # v6
+    deleted: bool = False
+
+
+@dataclass
+class Label:
+    """Text annotation anchored to a chart point (``label.new`` / ``label.set_*``)."""
+
+    x: int | float
+    y: float
+    text: str = ""
+    xloc: str = "bar_index"
+    yloc: str = "price"
+    color: str = "#000000"
+    textcolor: str = "#000000"
+    text_font_family: str = "default"
+    text_halign: str = "center"
+    text_valign: str = "center"
+    text_size: int | str = "auto"  # v6: supports int (points) or size.* consts
+    text_formatting: str = ""  # v6: "", "bold", "italic", or combination like "bold italic"
+    size: int | str = "auto"  # alias of text_size for label.set_size
+    tooltip: str = ""
+    style: str = "label_center"
+    border_color: str = "rgba(0,0,0,0)"
+    border_width: int = 0
+    border_style: str = "solid"
+    force_overlay: bool = False  # v6
+    deleted: bool = False
+
+
+@dataclass
+class Table:
+    """On-chart table grid with cell map (``table.new`` / ``table.cell``)."""
+
+    position: str = "top_left"  # Position on screen
+    rows: int = 0
+    columns: int = 0
+    frame_color: str = "#000000"
+    frame_width: int = 1
+    border_color: str = "#000000"
+    border_width: int = 1
+    bgcolor: str = "rgba(255,255,255,255)"
+    force_overlay: bool = False  # v6
+    cells: dict[tuple[int, int], TableCell] = field(default_factory=dict)
+    merged: list[tuple[int, int, int, int]] = field(default_factory=list)
+    deleted: bool = False
+
+
+@dataclass
+class TableCell:
+    """Single ``table`` cell style and text payload."""
+
+    text: str = ""
+    text_color: str = "#000000"
+    bgcolor: str = "rgba(255,255,255,255)"
+    border_color: str = "#000000"
+    border_width: int = 1
+    width: int | float | None = None
+    height: int | float | None = None
+    text_halign: str = "left"
+    text_valign: str = "top"
+    text_size: int | str = "auto"
+    text_font_family: str = "default"
+    text_formatting: str = ""
+    tooltip: str = ""
+
+
+@dataclass
+class LineFill:
+    """Fill region between two :class:`Line` objects (``linefill.new``)."""
+
+    line1: Line | None = None
+    line2: Line | None = None
+    color: str = "rgba(0,0,0,0)"
+    deleted: bool = False
+
+
+@dataclass
+class ChartPoint:
+    """Chart coordinate for polyline vertices (time/index + price)."""
+
+    time: int | float | None = None
+    index: int | None = None
+    price: float = 0.0
+
+    def copy(self) -> ChartPoint:
+        """Create a copy of the chart point."""
+        return ChartPoint(self.time, self.index, self.price)
+
+
+@dataclass
+class Polyline:
+    """Multi-point path (``polyline.new``); subject to polyline GC caps."""
+
+    points: list[ChartPoint] = field(default_factory=list)
+    closed: bool = False
+    xloc: str = "bar_index"
+    color: str = "#000000"
+    width: int = 1
+    style: str = "solid"
+    force_overlay: bool = False  # v6
+    curved: bool = False
+    fill_color: str | None = None
+    deleted: bool = False
+
+
+class DrawingBuiltinsMixin(BuiltinDispatchMixin):
+    """``line.*``, ``box.*``, ``label.*``, ``table.*``, ``polyline.*`` builtins.
+
+    Objects are stored in :class:`DrawingRegistry`. Bare type casts
+    (``line(id)``, ``box(na)``, …) are identity/na-preserving handlers used by
+    typed Pine scripts.
+    """
+
+    def _drawing_builtin_map(self) -> dict[str, BuiltinHandler]:
+        return {
+            # Line functions
+            # Bare type cast: line(na) / line(id) — identity cast used in reference scripts
+            "line": self._handle_type_cast,
+            "box": self._handle_type_cast,
+            "label": self._handle_type_cast,
+            "table": self._handle_type_cast,
+            "line.new": self._handle_line_new,
+            "line.delete": self._handle_line_delete,
+            "line.copy": self._handle_line_copy,
+            "line.set_x1": self._handle_line_set_x1,
+            "line.set_y1": self._handle_line_set_y1,
+            "line.set_x2": self._handle_line_set_x2,
+            "line.set_y2": self._handle_line_set_y2,
+            "line.set_extend": self._handle_line_set_extend,
+            "line.set_xloc": self._handle_line_set_xloc,
+            "line.set_color": self._handle_line_set_color,
+            "line.set_width": self._handle_line_set_width,
+            "line.set_style": self._handle_line_set_style,
+            "line.get_x1": self._handle_line_get_x1,
+            "line.get_y1": self._handle_line_get_y1,
+            "line.get_x2": self._handle_line_get_x2,
+            "line.get_y2": self._handle_line_get_y2,
+            "line.get_price": self._handle_line_get_price,
+            "line.set_xy1": self._handle_line_set_xy1,
+            "line.set_xy2": self._handle_line_set_xy2,
+            "line.set_first_point": self._handle_line_set_first_point,
+            "line.set_second_point": self._handle_line_set_second_point,
+            # Box functions
+            "box.new": self._handle_box_new,
+            "box.delete": self._handle_box_delete,
+            "box.copy": self._handle_box_copy,
+            "box.set_left": self._handle_box_set_left,
+            "box.set_right": self._handle_box_set_right,
+            "box.set_top": self._handle_box_set_top,
+            "box.set_bottom": self._handle_box_set_bottom,
+            "box.set_bgcolor": self._handle_box_set_bgcolor,
+            "box.set_border_color": self._handle_box_set_border_color,
+            "box.set_border_width": self._handle_box_set_border_width,
+            "box.set_border_style": self._handle_box_set_border_style,
+            "box.set_extend": self._handle_box_set_extend,
+            "box.set_xloc": self._handle_box_set_xloc,
+            "box.set_closed": self._handle_box_set_closed,
+            "box.set_lefttop": self._handle_box_set_lefttop,
+            "box.set_rightbottom": self._handle_box_set_rightbottom,
+            "box.set_top_left_point": self._handle_box_set_top_left_point,
+            "box.set_bottom_right_point": self._handle_box_set_bottom_right_point,
+            "box.set_text": self._handle_box_set_text,
+            "box.set_text_color": self._handle_box_set_text_color,
+            "box.set_text_font_family": self._handle_box_set_text_font_family,
+            "box.set_text_halign": self._handle_box_set_text_halign,
+            "box.set_text_valign": self._handle_box_set_text_valign,
+            "box.set_text_size": self._handle_box_set_text_size,
+            "box.set_text_formatting": self._handle_box_set_text_formatting,
+            "box.set_text_wrap": self._handle_box_set_text_wrap,
+            "box.get_left": self._handle_box_get_left,
+            "box.get_right": self._handle_box_get_right,
+            "box.get_top": self._handle_box_get_top,
+            "box.get_bottom": self._handle_box_get_bottom,
+            # Label functions
+            "label.new": self._handle_label_new,
+            "label.delete": self._handle_label_delete,
+            "label.copy": self._handle_label_copy,
+            "label.set_xy": self._handle_label_set_xy,
+            "label.set_x": self._handle_label_set_x,
+            "label.set_y": self._handle_label_set_y,
+            "label.set_text": self._handle_label_set_text,
+            "label.set_textcolor": self._handle_label_set_textcolor,
+            "label.set_textalign": self._handle_label_set_textalign,
+            "label.set_text_font_family": self._handle_label_set_text_font_family,
+            "label.set_text_halign": self._handle_label_set_text_halign,
+            "label.set_text_valign": self._handle_label_set_text_valign,
+            "label.set_text_size": self._handle_label_set_text_size,
+            "label.set_size": self._handle_label_set_size,
+            "label.set_text_formatting": self._handle_label_set_text_formatting,
+            "label.set_tooltip": self._handle_label_set_tooltip,
+            "label.set_color": self._handle_label_set_color,
+            "label.set_border_color": self._handle_label_set_border_color,
+            "label.set_border_width": self._handle_label_set_border_width,
+            "label.set_border_style": self._handle_label_set_border_style,
+            "label.set_style": self._handle_label_set_style,
+            "label.set_xloc": self._handle_label_set_xloc,
+            "label.set_yloc": self._handle_label_set_yloc,
+            "label.set_point": self._handle_label_set_point,
+            "label.get_x": self._handle_label_get_x,
+            "label.get_y": self._handle_label_get_y,
+            "label.get_text": self._handle_label_get_text,
+            # Table functions
+            "table.new": self._handle_table_new,
+            "table.delete": self._handle_table_delete,
+            "table.cell": self._handle_table_cell,
+            "table.cell_set_text": self._handle_table_cell_set_text,
+            "table.cell_set_text_color": self._handle_table_cell_set_text_color,
+            "table.cell_set_bgcolor": self._handle_table_cell_set_bgcolor,
+            "table.cell_set_border_color": self._handle_table_cell_set_border_color,
+            "table.cell_set_border_width": self._handle_table_cell_set_border_width,
+            "table.cell_set_width": self._handle_table_cell_set_width,
+            "table.cell_set_height": self._handle_table_cell_set_height,
+            "table.cell_set_text_halign": self._handle_table_cell_set_text_halign,
+            "table.cell_set_text_valign": self._handle_table_cell_set_text_valign,
+            "table.cell_set_text_size": self._handle_table_cell_set_text_size,
+            "table.cell_set_text_font_family": self._handle_table_cell_set_text_font_family,
+            "table.cell_set_text_formatting": self._handle_table_cell_set_text_formatting,
+            "table.cell_set_tooltip": self._handle_table_cell_set_tooltip,
+            "table.cell_get_text": self._handle_table_cell_get_text,
+            "table.clear": self._handle_table_clear,
+            "table.merge_cells": self._handle_table_merge_cells,
+            "table.set_position": self._handle_table_set_position,
+            "table.set_bgcolor": self._handle_table_set_bgcolor,
+            "table.set_border_color": self._handle_table_set_border_color,
+            "table.set_border_width": self._handle_table_set_border_width,
+            "table.set_frame_color": self._handle_table_set_frame_color,
+            "table.set_frame_width": self._handle_table_set_frame_width,
+            # Linefill
+            "linefill.new": self._handle_linefill_new,
+            "line.fill": self._handle_linefill_new,
+            "linefill.delete": self._handle_linefill_delete,
+            "linefill.set_color": self._handle_linefill_set_color,
+            "linefill.get_line1": self._handle_linefill_get_line1,
+            "linefill.get_line2": self._handle_linefill_get_line2,
+            # Chart point functions
+            "chart.point.new": self._handle_chart_point_new,
+            "chart.point.from_index": self._handle_chart_point_from_index,
+            "chart.point.from_time": self._handle_chart_point_from_time,
+            "chart.point.now": self._handle_chart_point_now,
+            "chart.point.copy": self._handle_chart_point_copy,
+            # Polyline functions
+            "polyline.new": self._handle_polyline_new,
+            "polyline.delete": self._handle_polyline_delete,
+            "polyline.get_points": self._handle_polyline_get_points,
+            "polyline.set_points": self._handle_polyline_set_points,
+            "polyline.set_line_color": self._handle_polyline_set_line_color,
+            "polyline.set_line_width": self._handle_polyline_set_line_width,
+            "polyline.set_line_style": self._handle_polyline_set_line_style,
+            "polyline.set_fill_color": self._handle_polyline_set_fill_color,
+            "polyline.set_curved": self._handle_polyline_set_curved,
+            "polyline.set_force_overlay": self._handle_polyline_set_force_overlay,
+            "polyline.set_closed": self._handle_polyline_set_closed,
+            "polyline.set_xloc": self._handle_polyline_set_xloc,
+            "polyline.copy": self._handle_polyline_copy,
+            # Collection accessors (array of non-deleted objects)
+            "line.all": self._handle_line_all,
+            "box.all": self._handle_box_all,
+            "label.all": self._handle_label_all,
+            "table.all": self._handle_table_all,
+            "polyline.all": self._handle_polyline_all,
+            "linefill.all": self._handle_linefill_all,
+        }
+
+    @staticmethod
+    def _active(items: list[Any]) -> list[Any]:
+        return [obj for obj in items if not getattr(obj, "deleted", False)]
+
+    def _handle_line_all(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> list[Any]:
+        return self._active(DrawingRegistry.lines)
+
+    def _handle_box_all(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> list[Any]:
+        return self._active(DrawingRegistry.boxes)
+
+    def _handle_label_all(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> list[Any]:
+        return self._active(DrawingRegistry.labels)
+
+    def _handle_table_all(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> list[Any]:
+        return self._active(DrawingRegistry.tables)
+
+    def _handle_polyline_all(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> list[Any]:
+        return self._active(DrawingRegistry.polylines)
+
+    def _handle_linefill_all(self, _args: list[Any], kwargs: dict[str, Any] | None = None) -> list[Any]:
+        return self._active(DrawingRegistry.linefills)
+
+    def _handle_type_cast(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Any:
+        """Identity cast for drawing types: ``line(na)``, ``label(x)``, etc."""
+        return args[0] if args else None
+
+    # LINE HANDLERS
+
+    def _handle_line_new(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Line:
+        """line.new(x1, y1, x2, y2, xloc=..., color=..., width=..., style=..., extend=...)."""
+        kw = kwargs or {}
+        x1 = kw.get("x1", args[0] if len(args) > 0 else 0)
+        y1 = kw.get("y1", args[1] if len(args) > 1 else 0.0)
+        x2 = kw.get("x2", args[2] if len(args) > 2 else 0)
+        y2 = kw.get("y2", args[3] if len(args) > 3 else 0.0)
+        xloc = kw.get("xloc", args[4] if len(args) > 4 else "bar_index")
+        # Pine often passes color as first keyword after positionals
+        color = kw.get("color", args[5] if len(args) > 5 else "#000000")
+        width = kw.get("width", args[6] if len(args) > 6 else 1)
+        style = kw.get("style", args[7] if len(args) > 7 else "solid")
+        extend = kw.get("extend", args[8] if len(args) > 8 else "none")
+        force_overlay = kw.get("force_overlay", args[9] if len(args) > 9 else False)
+        # Defensive: color hex accidentally in xloc from old merge path
+        if isinstance(xloc, str) and (xloc.startswith("#") or xloc.startswith("rgb")):
+            color = xloc
+            xloc = "bar_index"
+
+        line = Line(
+            _snapshot_scalar(x1),
+            _snapshot_scalar(y1),
+            _snapshot_scalar(x2),
+            _snapshot_scalar(y2),
+            str(xloc),
+            color,
+            width,
+            style,
+            extend,
+            force_overlay=bool(force_overlay),
+        )
+        return DrawingRegistry.add_line(line)
+
+    def _handle_line_delete(self, args: list[Any]) -> None:
+        """line.delete(line)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.deleted = True
+
+    def _handle_line_copy(self, args: list[Any]) -> Line:
+        """line.copy(line) - Returns a new line with same properties"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            new_line = Line(
+                line.x1, line.y1, line.x2, line.y2, line.xloc, line.color, line.width, line.style, line.extend
+            )
+            return DrawingRegistry.add_line(new_line)
+        return Line(0, 0.0, 0, 0.0)
+
+    def _handle_line_set_x1(self, args: list[Any]) -> Line:
+        """line.set_x1(line, x1)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.x1 = _snapshot_scalar(args[1]) if len(args) > 1 else line.x1
+        return line
+
+    def _handle_line_set_y1(self, args: list[Any]) -> Line:
+        """line.set_y1(line, y1)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.y1 = _snapshot_scalar(args[1]) if len(args) > 1 else line.y1
+        return line
+
+    def _handle_line_set_x2(self, args: list[Any]) -> Line:
+        """line.set_x2(line, x2)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.x2 = _snapshot_scalar(args[1]) if len(args) > 1 else line.x2
+        return line
+
+    def _handle_line_set_y2(self, args: list[Any]) -> Line:
+        """line.set_y2(line, y2)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.y2 = _snapshot_scalar(args[1]) if len(args) > 1 else line.y2
+        return line
+
+    def _handle_line_set_extend(self, args: list[Any]) -> Line:
+        """line.set_extend(line, extend)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.extend = args[1] if len(args) > 1 else line.extend
+        return line
+
+    def _handle_line_set_xloc(self, args: list[Any]) -> Line:
+        """line.set_xloc(line, xloc)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.xloc = args[1] if len(args) > 1 else line.xloc
+        return line
+
+    def _handle_line_set_color(self, args: list[Any]) -> Line:
+        """line.set_color(line, color)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.color = args[1] if len(args) > 1 else line.color
+        return line
+
+    def _handle_line_set_width(self, args: list[Any]) -> Line:
+        """line.set_width(line, width)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.width = args[1] if len(args) > 1 else line.width
+        return line
+
+    def _handle_line_set_style(self, args: list[Any]) -> Line:
+        """line.set_style(line, style)"""
+        line = args[0] if len(args) > 0 else None
+        if isinstance(line, Line):
+            line.style = args[1] if len(args) > 1 else line.style
+        return line
+
+    def _handle_line_get_x1(self, args: list[Any]) -> int | float | None:
+        """line.get_x1(line) — soft-na when id/endpoint is na; unwrap series."""
+        line = args[0] if len(args) > 0 else None
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.x1)
+
+    def _handle_line_get_y1(self, args: list[Any]) -> float | None:
+        """line.get_y1(line) — soft-na when id/endpoint is na; unwrap series."""
+        line = args[0] if len(args) > 0 else None
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.y1)
+
+    def _handle_line_get_x2(self, args: list[Any]) -> int | float | None:
+        """line.get_x2(line) — soft-na when id/endpoint is na; unwrap series."""
+        line = args[0] if len(args) > 0 else None
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.x2)
+
+    def _handle_line_get_y2(self, args: list[Any]) -> float | None:
+        """line.get_y2(line) — soft-na when id/endpoint is na; unwrap series."""
+        line = args[0] if len(args) > 0 else None
+        if not isinstance(line, Line):
+            return None
+        return _export_num(line.y2)
+
+    # BOX HANDLERS
+
+    def _handle_box_new(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Box:
+        """box.new(left, top, right, bottom, xloc=..., bgcolor=..., border_color=..., ...)."""
+        kw = kwargs or {}
+        left = kw.get("left", args[0] if len(args) > 0 else 0)
+        top = kw.get("top", args[1] if len(args) > 1 else 0.0)
+        right = kw.get("right", args[2] if len(args) > 2 else 0)
+        bottom = kw.get("bottom", args[3] if len(args) > 3 else 0.0)
+        xloc = kw.get("xloc", args[4] if len(args) > 4 else "bar_index")
+        closed = kw.get("closed", args[5] if len(args) > 5 else True)
+        bgcolor = kw.get("bgcolor", args[6] if len(args) > 6 else "rgba(0,0,0,0)")
+        border_color = kw.get(
+            "border_color",
+            args[7] if len(args) > 7 else "#000000",
+        )
+        border_width = kw.get("border_width", args[8] if len(args) > 8 else 1)
+        border_style = kw.get("border_style", args[9] if len(args) > 9 else "solid")
+        extend = kw.get("extend", args[10] if len(args) > 10 else "none")
+        force_overlay = kw.get("force_overlay", args[11] if len(args) > 11 else False)
+        text = kw.get("text", "")
+        text_color = kw.get("text_color", "#000000")
+        text_halign = kw.get("text_halign", "center")
+        text_valign = kw.get("text_valign", "center")
+        text_size = kw.get("text_size", "auto")
+        text_font_family = kw.get("text_font_family", "default")
+        text_wrap = kw.get("text_wrap", "none")
+
+        box = Box(
+            _snapshot_scalar(left),
+            _snapshot_scalar(top),
+            _snapshot_scalar(right),
+            _snapshot_scalar(bottom),
+            str(xloc),
+            bool(closed),
+            bgcolor,
+            border_color,
+            border_width,
+            border_style,
+            extend,
+            text=str(text) if text is not None else "",
+            text_color=str(text_color) if text_color is not None else "#000000",
+            text_font_family=str(text_font_family) if text_font_family is not None else "default",
+            text_halign=str(text_halign) if text_halign is not None else "center",
+            text_valign=str(text_valign) if text_valign is not None else "center",
+            text_size=text_size
+            if isinstance(text_size, (int, float))
+            else str(text_size)
+            if text_size is not None
+            else "auto",
+            text_wrap=str(text_wrap) if text_wrap is not None else "none",
+            force_overlay=bool(force_overlay),
+        )
+        return DrawingRegistry.add_box(box)
+
+    def _handle_box_delete(self, args: list[Any]) -> None:
+        """box.delete(box)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.deleted = True
+
+    def _handle_box_copy(self, args: list[Any]) -> Box:
+        """box.copy(box)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            new_box = Box(
+                box.left,
+                box.top,
+                box.right,
+                box.bottom,
+                box.xloc,
+                box.closed,
+                box.bgcolor,
+                box.border_color,
+                box.border_width,
+                box.border_style,
+                box.extend,
+            )
+            return DrawingRegistry.add_box(new_box)
+        return Box(0, 0.0, 0, 0.0)
+
+    def _handle_box_set_left(self, args: list[Any]) -> Box:
+        """box.set_left(box, left)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.left = _snapshot_scalar(args[1]) if len(args) > 1 else box.left
+        return box
+
+    def _handle_box_set_right(self, args: list[Any]) -> Box:
+        """box.set_right(box, right)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.right = _snapshot_scalar(args[1]) if len(args) > 1 else box.right
+        return box
+
+    def _handle_box_set_top(self, args: list[Any]) -> Box:
+        """box.set_top(box, top)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.top = _snapshot_scalar(args[1]) if len(args) > 1 else box.top
+        return box
+
+    def _handle_box_set_bottom(self, args: list[Any]) -> Box:
+        """box.set_bottom(box, bottom)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.bottom = _snapshot_scalar(args[1]) if len(args) > 1 else box.bottom
+        return box
+
+    def _handle_box_set_bgcolor(self, args: list[Any]) -> Box:
+        """box.set_bgcolor(box, color)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.bgcolor = args[1] if len(args) > 1 else box.bgcolor
+        return box
+
+    def _handle_box_set_border_color(self, args: list[Any]) -> Box:
+        """box.set_border_color(box, color)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.border_color = args[1] if len(args) > 1 else box.border_color
+        return box
+
+    def _handle_box_set_border_width(self, args: list[Any]) -> Box:
+        """box.set_border_width(box, width)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.border_width = args[1] if len(args) > 1 else box.border_width
+        return box
+
+    def _handle_box_set_border_style(self, args: list[Any]) -> Box:
+        """box.set_border_style(box, style)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.border_style = args[1] if len(args) > 1 else box.border_style
+        return box
+
+    def _handle_box_set_extend(self, args: list[Any]) -> Box:
+        """box.set_extend(box, extend)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.extend = args[1] if len(args) > 1 else box.extend
+        return box
+
+    def _handle_box_set_xloc(self, args: list[Any]) -> Box:
+        """box.set_xloc(box, left, right, xloc)
+
+        Set the left and right coordinates of the box borders.
+        Added March 2025: Full parameter support for left, right, and xloc.
+
+        Parameters:
+            box: The box object to modify
+            left: Left coordinate (bar index or timestamp based on xloc)
+            right: Right coordinate (bar index or timestamp based on xloc)
+            xloc: Coordinate type ("bar_index" or "time")
+
+        Returns the modified box.
+        """
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            if len(args) > 1:
+                box.left = args[1]
+            if len(args) > 2:
+                box.right = args[2]
+            if len(args) > 3:
+                box.xloc = args[3]
+        return box
+
+    def _handle_box_set_closed(self, args: list[Any]) -> Box:
+        """box.set_closed(box, closed)"""
+        box = args[0] if len(args) > 0 else None
+        if isinstance(box, Box):
+            box.closed = args[1] if len(args) > 1 else box.closed
+        return box
+
+    def _handle_box_get_left(self, args: list[Any]) -> int | float:
+        """box.get_left(box)"""
+        box = args[0] if len(args) > 0 else None
+        return box.left if isinstance(box, Box) else 0
+
+    def _handle_box_get_right(self, args: list[Any]) -> int | float:
+        """box.get_right(box)"""
+        box = args[0] if len(args) > 0 else None
+        return box.right if isinstance(box, Box) else 0
+
+    def _handle_box_get_top(self, args: list[Any]) -> float:
+        """box.get_top(box)"""
+        box = args[0] if len(args) > 0 else None
+        return box.top if isinstance(box, Box) else 0.0
+
+    def _handle_box_get_bottom(self, args: list[Any]) -> float:
+        """box.get_bottom(box)"""
+        box = args[0] if len(args) > 0 else None
+        return box.bottom if isinstance(box, Box) else 0.0
+
+    # LABEL HANDLERS
+
+    def _handle_label_new(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Label:
+        """label.new(x, y, text, ...) or label.new(point, text, ...).
+
+        Pine v5+ accepts ``label.new(point = chart.point.now(), ...)`` where
+        *point* supplies both coordinates. Without expanding ChartPoint here,
+        ``label.x`` stored the object and ``get_x()`` returned it — Console's
+        ``chart.point.tostring()`` (label.new → get_x → x.tostring) then
+        recursed forever.
+        """
+        kwargs = kwargs or {}
+
+        def _coord_from_point(point: ChartPoint) -> tuple[int | float, float]:
+            x_val: int | float
+            if point.index is not None:
+                x_val = point.index
+            elif point.time is not None:
+                x_val = point.time
+            else:
+                x_val = 0
+            return x_val, float(point.price)
+
+        point = kwargs.get("point")
+        if point is None and args and isinstance(args[0], ChartPoint):
+            # Positional point form: label.new(point, text, xloc, yloc, color, style, ...)
+            point = args[0]
+            x, y = _coord_from_point(point)
+            text = kwargs.get("text", args[1] if len(args) > 1 else "")
+            xloc = kwargs.get("xloc", args[2] if len(args) > 2 else "bar_index")
+            yloc = kwargs.get("yloc", args[3] if len(args) > 3 else "price")
+            color = kwargs.get("color", args[4] if len(args) > 4 else "#000000")
+            # style comes before textcolor in the point overload
+            style = kwargs.get("style", args[5] if len(args) > 5 else "label_center")
+            textcolor = kwargs.get("textcolor", args[6] if len(args) > 6 else "#000000")
+            text_size = kwargs.get("size", kwargs.get("text_size", args[7] if len(args) > 7 else "auto"))
+            text_halign = kwargs.get("textalign", kwargs.get("text_halign", args[8] if len(args) > 8 else "center"))
+            tooltip = kwargs.get("tooltip", args[9] if len(args) > 9 else "")
+            force_overlay = kwargs.get("force_overlay", args[10] if len(args) > 10 else False)
+            text_font_family = kwargs.get("text_font_family", args[11] if len(args) > 11 else "default")
+            text_valign = kwargs.get("text_valign", "center")
+            text_formatting = kwargs.get("text_formatting", "")
+        elif isinstance(point, ChartPoint):
+            # Keyword point form: label.new(point=..., text=..., ...)
+            x, y = _coord_from_point(point)
+            text = kwargs.get("text", args[0] if len(args) > 0 else "")
+            xloc = kwargs.get("xloc", "bar_index")
+            yloc = kwargs.get("yloc", "price")
+            color = kwargs.get("color", "#000000")
+            textcolor = kwargs.get("textcolor", "#000000")
+            text_font_family = kwargs.get("text_font_family", "default")
+            text_halign = kwargs.get("textalign", kwargs.get("text_halign", "center"))
+            text_valign = kwargs.get("text_valign", "center")
+            text_size = kwargs.get("size", kwargs.get("text_size", "auto"))
+            text_formatting = kwargs.get("text_formatting", "")
+            tooltip = kwargs.get("tooltip", "")
+            style = kwargs.get("style", "label_center")
+            force_overlay = kwargs.get("force_overlay", False)
+        else:
+            # Classic label.new(x, y, text, xloc, yloc, color, textcolor, ...)
+            x = kwargs.get("x", args[0] if len(args) > 0 else 0)
+            y = kwargs.get("y", args[1] if len(args) > 1 else 0.0)
+            text = kwargs.get("text", args[2] if len(args) > 2 else "")
+            xloc = kwargs.get("xloc", args[3] if len(args) > 3 else "bar_index")
+            yloc = kwargs.get("yloc", args[4] if len(args) > 4 else "price")
+            color = kwargs.get("color", args[5] if len(args) > 5 else "#000000")
+            textcolor = kwargs.get("textcolor", args[6] if len(args) > 6 else "#000000")
+            text_font_family = kwargs.get("text_font_family", args[7] if len(args) > 7 else "default")
+            text_halign = kwargs.get("text_halign", args[8] if len(args) > 8 else "center")
+            text_valign = kwargs.get("text_valign", args[9] if len(args) > 9 else "center")
+            text_size = kwargs.get("text_size", kwargs.get("size", args[10] if len(args) > 10 else "auto"))
+            text_formatting = kwargs.get("text_formatting", args[11] if len(args) > 11 else "")
+            tooltip = kwargs.get("tooltip", args[12] if len(args) > 12 else "")
+            style = kwargs.get("style", args[13] if len(args) > 13 else "label_center")
+            force_overlay = kwargs.get("force_overlay", args[14] if len(args) > 14 else False)
+            # Defensive: x accidentally a ChartPoint (legacy merge path)
+            if isinstance(x, ChartPoint):
+                x, y = _coord_from_point(x)
+
+        # Keyword ctor — `size` sits before `tooltip`/`style` in the dataclass.
+        label = Label(
+            x=_snapshot_scalar(x),
+            y=_snapshot_scalar(y),
+            text=str(text or ""),
+            xloc=str(xloc or "bar_index"),
+            yloc=str(yloc or "price"),
+            color=color,
+            textcolor=textcolor,
+            text_font_family=text_font_family,
+            text_halign=text_halign,
+            text_valign=text_valign,
+            text_size=text_size,
+            text_formatting=text_formatting,
+            size=text_size,
+            tooltip=str(tooltip or ""),
+            style=str(style or "label_center"),
+            force_overlay=bool(force_overlay),
+        )
+        return DrawingRegistry.add_label(label)
+
+    def _handle_label_delete(self, args: list[Any]) -> None:
+        """label.delete(label)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.deleted = True
+
+    def _handle_label_copy(self, args: list[Any]) -> Label:
+        """label.copy(label)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            new_label = Label(
+                x=label.x,
+                y=label.y,
+                text=label.text,
+                xloc=label.xloc,
+                yloc=label.yloc,
+                color=label.color,
+                textcolor=label.textcolor,
+                text_font_family=label.text_font_family,
+                text_halign=label.text_halign,
+                text_valign=label.text_valign,
+                text_size=label.text_size,
+                text_formatting=label.text_formatting,
+                size=label.size,
+                tooltip=label.tooltip,
+                style=label.style,
+                border_color=label.border_color,
+                border_width=label.border_width,
+                border_style=label.border_style,
+                force_overlay=label.force_overlay,
+            )
+            return DrawingRegistry.add_label(new_label)
+        return Label(0, 0.0)
+
+    def _handle_label_set_xy(self, args: list[Any]) -> Label:
+        """label.set_xy(label, x, y)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.x = _snapshot_scalar(args[1]) if len(args) > 1 else label.x
+            label.y = _snapshot_scalar(args[2]) if len(args) > 2 else label.y
+        return label
+
+    def _handle_label_set_x(self, args: list[Any]) -> Label:
+        """label.set_x(label, x)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.x = _snapshot_scalar(args[1]) if len(args) > 1 else label.x
+        return label
+
+    def _handle_label_set_y(self, args: list[Any]) -> Label:
+        """label.set_y(label, y)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.y = _snapshot_scalar(args[1]) if len(args) > 1 else label.y
+        return label
+
+    def _handle_label_set_text(self, args: list[Any]) -> Label:
+        """label.set_text(label, text)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.text = args[1] if len(args) > 1 else label.text
+        return label
+
+    def _handle_label_set_textcolor(self, args: list[Any]) -> Label:
+        """label.set_textcolor(label, color)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.textcolor = args[1] if len(args) > 1 else label.textcolor
+        return label
+
+    def _handle_label_set_text_font_family(self, args: list[Any]) -> Label:
+        """label.set_text_font_family(label, font_family)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.text_font_family = args[1] if len(args) > 1 else label.text_font_family
+        return label
+
+    def _handle_label_set_text_halign(self, args: list[Any]) -> Label:
+        """label.set_text_halign(label, halign)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.text_halign = args[1] if len(args) > 1 else label.text_halign
+        return label
+
+    def _handle_label_set_text_valign(self, args: list[Any]) -> Label:
+        """label.set_text_valign(label, valign)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.text_valign = args[1] if len(args) > 1 else label.text_valign
+        return label
+
+    def _handle_label_set_text_size(self, args: list[Any]) -> Label:
+        """label.set_text_size(label, size)  # v6 int (points) or const supported"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            new_size = args[1] if len(args) > 1 else label.text_size
+            label.text_size = new_size
+        return label
+
+    def _handle_label_set_text_formatting(self, args: list[Any]) -> Label:
+        """label.set_text_formatting(label, formatting)  # v6"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.text_formatting = args[1] if len(args) > 1 else label.text_formatting
+        return label
+
+    def _handle_label_set_tooltip(self, args: list[Any]) -> Label:
+        """label.set_tooltip(label, tooltip)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.tooltip = args[1] if len(args) > 1 else label.tooltip
+        return label
+
+    def _handle_label_set_color(self, args: list[Any]) -> Label:
+        """label.set_color(label, color)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.color = args[1] if len(args) > 1 else label.color
+        return label
+
+    def _handle_label_set_border_color(self, args: list[Any]) -> Label:
+        """label.set_border_color(label, color)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.border_color = args[1] if len(args) > 1 else label.border_color
+        return label
+
+    def _handle_label_set_border_width(self, args: list[Any]) -> Label:
+        """label.set_border_width(label, width)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.border_width = args[1] if len(args) > 1 else label.border_width
+        return label
+
+    def _handle_label_set_border_style(self, args: list[Any]) -> Label:
+        """label.set_border_style(label, style)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.border_style = args[1] if len(args) > 1 else label.border_style
+        return label
+
+    def _handle_label_set_style(self, args: list[Any]) -> Label:
+        """label.set_style(label, style)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.style = args[1] if len(args) > 1 else label.style
+        return label
+
+    def _handle_label_set_xloc(self, args: list[Any]) -> Label:
+        """label.set_xloc(label, xloc)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.xloc = args[1] if len(args) > 1 else label.xloc
+        return label
+
+    def _handle_label_set_yloc(self, args: list[Any]) -> Label:
+        """label.set_yloc(label, yloc)"""
+        label = args[0] if len(args) > 0 else None
+        if isinstance(label, Label):
+            label.yloc = args[1] if len(args) > 1 else label.yloc
+        return label
+
+    def _handle_label_get_x(self, args: list[Any]) -> int | float:
+        """label.get_x(label)"""
+        label = args[0] if len(args) > 0 else None
+        if not isinstance(label, Label):
+            return 0
+        x = label.x
+        # Unwrap if x was stored as ChartPoint (legacy label.new(point=...))
+        if isinstance(x, ChartPoint):
+            if x.index is not None:
+                return x.index
+            return x.time if x.time is not None else 0
+        return x
+
+    def _handle_label_get_y(self, args: list[Any]) -> float:
+        """label.get_y(label)"""
+        label = args[0] if len(args) > 0 else None
+        if not isinstance(label, Label):
+            return 0.0
+        y = label.y
+        if isinstance(y, ChartPoint):
+            return float(y.price)
+        return y
+
+    def _handle_label_get_text(self, args: list[Any]) -> str:
+        """label.get_text(label)"""
+        label = args[0] if len(args) > 0 else None
+        return label.text if isinstance(label, Label) else ""
+
+    # TABLE HANDLERS
+
+    def _handle_table_new(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Table:
+        """table.new(position, columns, rows, bgcolor, frame_color, ...).
+
+        Positional order matches Pine: columns then rows, then bgcolor.
+        """
+        kw = kwargs or {}
+        position = kw.get("position", args[0] if len(args) > 0 else "top_left")
+        columns = kw.get("columns", args[1] if len(args) > 1 else 0)
+        rows = kw.get("rows", args[2] if len(args) > 2 else 0)
+        bgcolor = kw.get("bgcolor", args[3] if len(args) > 3 else "rgba(255,255,255,255)")
+        frame_color = kw.get("frame_color", args[4] if len(args) > 4 else "#000000")
+        frame_width = kw.get("frame_width", args[5] if len(args) > 5 else 1)
+        border_color = kw.get("border_color", args[6] if len(args) > 6 else "#000000")
+        border_width = kw.get("border_width", args[7] if len(args) > 7 else 1)
+        force_overlay = kw.get("force_overlay", args[8] if len(args) > 8 else False)
+
+        table = Table(
+            position,
+            rows,
+            columns,
+            frame_color,
+            frame_width,
+            border_color,
+            border_width,
+            bgcolor,
+            force_overlay=force_overlay,
+        )
+        return DrawingRegistry.add_table(table)
+
+    def _handle_table_delete(self, args: list[Any]) -> None:
+        """table.delete(table)"""
+        table = args[0] if len(args) > 0 else None
+        if isinstance(table, Table):
+            table.deleted = True
+
+    def _handle_table_cell(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> TableCell:
+        """table.cell(table_id, column, row, text, ...).
+
+        reference Pine order is **column then row** (not row, column).
+        Optional text and style kwargs update the cell in place.
+        """
+        kw = kwargs or {}
+        table = kw.get("table_id", kw.get("table", args[0] if len(args) > 0 else None))
+        # Reference Pine: column, row — also accept swapped if named
+        column = kw.get("column", args[1] if len(args) > 1 else 0)
+        row = kw.get("row", args[2] if len(args) > 2 else 0)
+        text = kw.get("text", args[3] if len(args) > 3 else None)
+        # Reference order (v5 and v6 agree): width=4 height=5 text_color=6
+        # halign=7 valign=8 size=9 bgcolor=10 tooltip=11, plus v6
+        # text_font_family=12 text_formatting=13.
+        width = kw.get("width", args[4] if len(args) > 4 else None)
+        height = kw.get("height", args[5] if len(args) > 5 else None)
+        text_color = kw.get("text_color", args[6] if len(args) > 6 else None)
+        text_halign = kw.get("text_halign", args[7] if len(args) > 7 else None)
+        text_valign = kw.get("text_valign", args[8] if len(args) > 8 else None)
+        text_size = kw.get("text_size", args[9] if len(args) > 9 else None)
+        bgcolor = kw.get("bgcolor", args[10] if len(args) > 10 else None)
+        tooltip = kw.get("tooltip", args[11] if len(args) > 11 else None)
+        text_font_family = kw.get("text_font_family", args[12] if len(args) > 12 else None)
+        text_formatting = kw.get("text_formatting", args[13] if len(args) > 13 else None)
+
+        try:
+            col_i = int(column)
+            row_i = int(row)
+        except (TypeError, ValueError):
+            col_i, row_i = 0, 0
+
+        if isinstance(table, Table):
+            key = (row_i, col_i)
+            if key not in table.cells:
+                table.cells[key] = TableCell()
+            cell = table.cells[key]
+            if text is not None:
+                cell.text = str(text)
+            if text_color is not None:
+                cell.text_color = str(text_color)
+            if bgcolor is not None:
+                cell.bgcolor = str(bgcolor)
+            if tooltip is not None:
+                cell.tooltip = str(tooltip)
+            if width is not None:
+                cell.width = width
+            if height is not None:
+                cell.height = height
+            if text_halign is not None:
+                cell.text_halign = str(text_halign)
+            if text_valign is not None:
+                cell.text_valign = str(text_valign)
+            if text_size is not None:
+                cell.text_size = text_size if isinstance(text_size, (int, float)) else str(text_size)
+            if text_font_family is not None:
+                cell.text_font_family = str(text_font_family)
+            if text_formatting is not None:
+                cell.text_formatting = str(text_formatting)
+            return cell
+        return TableCell()
+
+    def _handle_table_cell_set_text(self, args: list[Any]) -> None:
+        """table.cell_set_text(table, row, column, text)"""
+        table = args[0] if len(args) > 0 else None
+        row = args[1] if len(args) > 1 else 0
+        column = args[2] if len(args) > 2 else 0
+        text = args[3] if len(args) > 3 else ""
+
+        if isinstance(table, Table):
+            key = (row, column)
+            if key not in table.cells:
+                table.cells[key] = TableCell()
+            table.cells[key].text = text
+
+    def _handle_table_cell_set_text_color(self, args: list[Any]) -> None:
+        """table.cell_set_text_color(table, row, column, color)"""
+        table = args[0] if len(args) > 0 else None
+        row = args[1] if len(args) > 1 else 0
+        column = args[2] if len(args) > 2 else 0
+        color = args[3] if len(args) > 3 else "#000000"
+
+        if isinstance(table, Table):
+            key = (row, column)
+            if key not in table.cells:
+                table.cells[key] = TableCell()
+            table.cells[key].text_color = color
+
+    def _handle_table_cell_set_bgcolor(self, args: list[Any]) -> None:
+        """table.cell_set_bgcolor(table, row, column, color)"""
+        table = args[0] if len(args) > 0 else None
+        row = args[1] if len(args) > 1 else 0
+        column = args[2] if len(args) > 2 else 0
+        color = args[3] if len(args) > 3 else "rgba(255,255,255,255)"
+
+        if isinstance(table, Table):
+            key = (row, column)
+            if key not in table.cells:
+                table.cells[key] = TableCell()
+            table.cells[key].bgcolor = color
+
+    def _handle_table_cell_set_border_color(self, args: list[Any]) -> None:
+        """table.cell_set_border_color(table, row, column, color)"""
+        table = args[0] if len(args) > 0 else None
+        row = args[1] if len(args) > 1 else 0
+        column = args[2] if len(args) > 2 else 0
+        color = args[3] if len(args) > 3 else "#000000"
+
+        if isinstance(table, Table):
+            key = (row, column)
+            if key not in table.cells:
+                table.cells[key] = TableCell()
+            table.cells[key].border_color = color
+
+    def _handle_table_cell_set_border_width(self, args: list[Any]) -> None:
+        """table.cell_set_border_width(table, row, column, width)"""
+        table = args[0] if len(args) > 0 else None
+        row = args[1] if len(args) > 1 else 0
+        column = args[2] if len(args) > 2 else 0
+        width = args[3] if len(args) > 3 else 1
+
+        if isinstance(table, Table):
+            key = (row, column)
+            if key not in table.cells:
+                table.cells[key] = TableCell()
+            table.cells[key].border_width = width
+
+    def _handle_table_cell_get_text(self, args: list[Any]) -> str:
+        """table.cell_get_text(table, row, column)"""
+        table = args[0] if len(args) > 0 else None
+        row = args[1] if len(args) > 1 else 0
+        column = args[2] if len(args) > 2 else 0
+
+        if isinstance(table, Table):
+            key = (row, column)
+            if key in table.cells:
+                return table.cells[key].text
+        return ""
+
+    def _table_cell_index(self, value: Any) -> int | None:
+        """Coerce a table row/column to int; ``na`` / non-numeric → ``None``."""
+        if value is None:
+            return None
+        current = getattr(value, "current", None)
+        if current is not None and not isinstance(value, (int, float, bool)):
+            value = current
+        if value is None:
+            return None
+        try:
+            if isinstance(value, float) and value != value:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _handle_table_clear(self, args: list[Any]) -> None:
+        """table.clear(table, start_row, start_col, end_row, end_col)"""
+        table = args[0] if len(args) > 0 else None
+
+        if not isinstance(table, Table):
+            return
+        if len(args) < 5:
+            table.cells.clear()
+            return
+        coords = [self._table_cell_index(a) for a in args[1:5]]
+        if any(c is None for c in coords):
+            return
+        r0, c0, r1, c1 = coords
+        for key in [k for k in table.cells if r0 <= k[0] <= r1 and c0 <= k[1] <= c1]:
+            del table.cells[key]
+
+    def _handle_table_merge_cells(self, args: list[Any]) -> None:
+        """table.merge_cells(table, start_row, start_col, end_row, end_col)"""
+        table = args[0] if len(args) > 0 else None
+        if not isinstance(table, Table) or len(args) < 5:
+            return
+        coords = [self._table_cell_index(a) for a in args[1:5]]
+        if any(c is None for c in coords):
+            return
+        r0, c0, r1, c1 = coords
+        if r1 < r0 or c1 < c0:
+            return
+        for er0, ec0, er1, ec1 in table.merged:
+            if not (r1 < er0 or er1 < r0 or c1 < ec0 or ec1 < c0):
+                return  # overlap → soft-ignore (Pine errors; we drop silently)
+        table.merged.append((r0, c0, r1, c1))
+
+    # CHART POINT HANDLERS
+
+    def _chart_point_price(self, price: Any) -> float | None:
+        """Coerce price for ChartPoint; unwrap PineSeries; ``na`` → None."""
+        if price is None:
+            return None
+        if hasattr(price, "current"):
+            price = getattr(price, "current", None)
+        if price is None:
+            return None
+        try:
+            return float(price)
+        except (TypeError, ValueError):
+            return None
+
+    def _handle_chart_point_new(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> ChartPoint | None:
+        """chart.point.new(time, price) - Create a point from time and price"""
+        kw = kwargs or {}
+        time = kw.get("time", args[0] if len(args) > 0 else None)
+        price = self._chart_point_price(kw.get("price", args[1] if len(args) > 1 else 0.0))
+        if price is None:
+            return None
+        return ChartPoint(time=time, price=price)
+
+    def _handle_chart_point_from_index(
+        self, args: list[Any], kwargs: dict[str, Any] | None = None
+    ) -> ChartPoint | None:
+        """chart.point.from_index(index, price) - Create a point from bar index and price"""
+        kw = kwargs or {}
+        index = kw.get("index", args[0] if len(args) > 0 else 0)
+        price = self._chart_point_price(kw.get("price", args[1] if len(args) > 1 else 0.0))
+        if price is None or index is None:
+            return None
+        try:
+            return ChartPoint(index=int(index), price=price)
+        except (TypeError, ValueError):
+            return None
+
+    def _handle_chart_point_from_time(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> ChartPoint | None:
+        """chart.point.from_time(time, price) - Create a point from timestamp and price"""
+        kw = kwargs or {}
+        time = kw.get("time", args[0] if len(args) > 0 else None)
+        price = self._chart_point_price(kw.get("price", args[1] if len(args) > 1 else 0.0))
+        if price is None:
+            return None
+        return ChartPoint(time=time, price=price)
+
+    def _handle_chart_point_now(self, args: list[Any]) -> ChartPoint | None:
+        """chart.point.now(price) - Create a point at current bar with given price"""
+        price = self._chart_point_price(args[0] if len(args) > 0 else 0.0)
+        if price is None:
+            return None
+        # Prefer live bar context so label.new(point=...) / get_x get a real index
+        ctx = getattr(self, "context", None) or {}
+        bar_index = ctx.get("bar_index")
+        bar_time = ctx.get("time")
+        # Host may store time as PineSeries (history-capable); unwrap current.
+        cur = getattr(bar_time, "current", None)
+        if cur is not None and not isinstance(bar_time, (int, float)):
+            bar_time = cur
+        try:
+            index = int(bar_index) if bar_index is not None else None
+        except (TypeError, ValueError):
+            index = None
+        try:
+            tval = int(bar_time) if bar_time is not None else None
+        except (TypeError, ValueError):
+            tval = None
+        return ChartPoint(time=tval, index=index, price=price)
+
+    def _handle_chart_point_copy(self, args: list[Any]) -> ChartPoint:
+        """chart.point.copy(point) - Create a copy of a chart point"""
+        point = args[0] if len(args) > 0 else None
+        if isinstance(point, ChartPoint):
+            return point.copy()
+        return ChartPoint()
+
+    # POLYLINE HANDLERS
+
+    def _handle_polyline_new(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Polyline:
+        """polyline.new(points, closed=..., xloc=..., color=..., width=..., style=...)."""
+        kw = kwargs or {}
+        points = kw.get("points", args[0] if len(args) > 0 else [])
+        closed = kw.get("closed", args[1] if len(args) > 1 else False)
+        xloc = kw.get("xloc", args[2] if len(args) > 2 else "bar_index")
+        color = kw.get("color", args[3] if len(args) > 3 else "#000000")
+        width = kw.get("width", args[4] if len(args) > 4 else 1)
+        style = kw.get("style", args[5] if len(args) > 5 else "solid")
+        force_overlay = kw.get("force_overlay", args[6] if len(args) > 6 else False)
+        curved = kw.get("curved", False)
+        fill_color = kw.get("fill_color")
+        # Normalize xloc enums like xloc.bar_index
+        xloc_s = str(xloc or "bar_index").replace("xloc.", "")
+        pts = list(points) if isinstance(points, list) else []
+        # Drop None entries from failed chart.point factories
+        pts = [p for p in pts if p is not None]
+
+        polyline = Polyline(
+            points=pts,
+            closed=bool(closed),
+            xloc=xloc_s,
+            color=str(color),
+            width=int(width) if width is not None else 1,
+            style=str(style or "solid"),
+            force_overlay=bool(force_overlay),
+            curved=bool(curved),
+            fill_color=None if fill_color is None else str(fill_color),
+        )
+        return DrawingRegistry.add_polyline(polyline)
+
+    def _handle_polyline_delete(self, args: list[Any]) -> None:
+        """polyline.delete(polyline)"""
+        polyline = args[0] if len(args) > 0 else None
+        if isinstance(polyline, Polyline):
+            polyline.deleted = True
+
+    def _handle_polyline_get_points(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> list[Any]:
+        """polyline.get_points(id) → array of chart.point."""
+        pl = args[0] if args else None
+        if isinstance(pl, Polyline) and not pl.deleted:
+            return list(pl.points)
+        return []
+
+    def _handle_polyline_set_points(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        """polyline.set_points(id, points)."""
+        pl = args[0] if args else None
+        points = args[1] if len(args) > 1 else (kwargs or {}).get("points")
+        if isinstance(pl, Polyline):
+            pts = list(points) if isinstance(points, list) else []
+            pl.points = [p for p in pts if p is not None]
+
+    def _handle_polyline_set_line_color(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        color = args[1] if len(args) > 1 else (kwargs or {}).get("color")
+        if isinstance(pl, Polyline) and color is not None:
+            pl.color = str(color)
+
+    def _handle_polyline_set_line_width(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        width = args[1] if len(args) > 1 else (kwargs or {}).get("width")
+        if isinstance(pl, Polyline) and width is not None:
+            pl.width = int(width)
+
+    def _handle_polyline_set_line_style(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        style = args[1] if len(args) > 1 else (kwargs or {}).get("style")
+        if isinstance(pl, Polyline) and style is not None:
+            pl.style = str(style).replace("line.style_", "")
+
+    def _handle_polyline_set_fill_color(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        color = args[1] if len(args) > 1 else (kwargs or {}).get("fill_color", (kwargs or {}).get("color"))
+        if isinstance(pl, Polyline):
+            pl.fill_color = None if color is None else str(color)
+
+    def _handle_polyline_set_curved(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        curved = args[1] if len(args) > 1 else (kwargs or {}).get("curved", True)
+        if isinstance(pl, Polyline):
+            pl.curved = bool(curved)
+
+    def _handle_polyline_set_force_overlay(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        fo = args[1] if len(args) > 1 else (kwargs or {}).get("force_overlay", True)
+        if isinstance(pl, Polyline):
+            pl.force_overlay = bool(fo)
+
+    def _handle_polyline_set_closed(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        closed = args[1] if len(args) > 1 else (kwargs or {}).get("closed", True)
+        if isinstance(pl, Polyline):
+            pl.closed = bool(closed)
+
+    def _handle_polyline_set_xloc(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> None:
+        pl = args[0] if args else None
+        xloc = args[1] if len(args) > 1 else (kwargs or {}).get("xloc")
+        if isinstance(pl, Polyline) and xloc is not None:
+            pl.xloc = str(xloc).replace("xloc.", "")
+
+    def _handle_polyline_copy(self, args: list[Any], kwargs: dict[str, Any] | None = None) -> Polyline | None:
+        """polyline.copy(id) → new polyline with copied fields."""
+        pl = args[0] if args else None
+        if not isinstance(pl, Polyline):
+            return None
+        clone = Polyline(
+            points=list(pl.points),
+            closed=pl.closed,
+            xloc=pl.xloc,
+            color=pl.color,
+            width=pl.width,
+            style=pl.style,
+            force_overlay=pl.force_overlay,
+            curved=pl.curved,
+            fill_color=pl.fill_color,
+        )
+        return DrawingRegistry.add_polyline(clone)
+
+    # ========== MISSING reference SURFACE HANDLERS ==========
+
+    def _handle_line_get_price(self, args: list[Any]) -> float | None:
+        """line.get_price(id, x) — interpolate Y at X between endpoints.
+
+        reference soft-na: ``na`` line, ``na`` sample *x*, or any na endpoint → ``na``.
+        PineSeries / series-wrapper endpoints are coerced to their current
+        scalar (bar-mode ``high`` / ``hlc3`` often land unwrapped only later).
+        """
+        line = args[0] if args else None
+        x = args[1] if len(args) > 1 else None
+        if not isinstance(line, Line):
+            return None
+        xv = _export_num(x)
+        x1 = _export_num(line.x1)
+        x2 = _export_num(line.x2)
+        y1 = _export_num(line.y1)
+        y2 = _export_num(line.y2)
+        if xv is None or x1 is None or x2 is None or y1 is None or y2 is None:
+            return None
+        x1f = float(x1)
+        x2f = float(x2)
+        y1f = float(y1)
+        y2f = float(y2)
+        xvf = float(xv)
+        if x1f == x2f:
+            return y1f
+        t = (xvf - x1f) / (x2f - x1f)
+        return y1f + t * (y2f - y1f)
+
+    def _handle_line_set_xy1(self, args: list[Any]) -> None:
+        line = args[0] if args else None
+        if isinstance(line, Line) and len(args) >= 3:
+            line.x1, line.y1 = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
+
+    def _handle_line_set_xy2(self, args: list[Any]) -> None:
+        line = args[0] if args else None
+        if isinstance(line, Line) and len(args) >= 3:
+            line.x2, line.y2 = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
+
+    def _handle_line_set_first_point(self, args: list[Any]) -> None:
+        """line.set_first_point(id, point) where point is ChartPoint."""
+        line = args[0] if args else None
+        point = args[1] if len(args) > 1 else None
+        if isinstance(line, Line) and isinstance(point, ChartPoint):
+            line.x1 = point.index if point.index is not None else (point.time or 0)
+            line.y1 = point.price
+
+    def _handle_line_set_second_point(self, args: list[Any]) -> None:
+        line = args[0] if args else None
+        point = args[1] if len(args) > 1 else None
+        if isinstance(line, Line) and isinstance(point, ChartPoint):
+            line.x2 = point.index if point.index is not None else (point.time or 0)
+            line.y2 = point.price
+
+    def _handle_box_set_lefttop(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) >= 3:
+            box.left, box.top = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
+
+    def _handle_box_set_rightbottom(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) >= 3:
+            box.right, box.bottom = _snapshot_scalar(args[1]), _snapshot_scalar(args[2])
+
+    def _handle_box_set_top_left_point(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        point = args[1] if len(args) > 1 else None
+        if isinstance(box, Box) and isinstance(point, ChartPoint):
+            box.left = point.index if point.index is not None else (point.time or 0)
+            box.top = point.price
+
+    def _handle_box_set_bottom_right_point(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        point = args[1] if len(args) > 1 else None
+        if isinstance(box, Box) and isinstance(point, ChartPoint):
+            box.right = point.index if point.index is not None else (point.time or 0)
+            box.bottom = point.price
+
+    def _handle_box_set_text(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text = str(args[1])
+
+    def _handle_box_set_text_color(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text_color = args[1]
+
+    def _handle_box_set_text_font_family(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text_font_family = str(args[1])
+
+    def _handle_box_set_text_halign(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text_halign = str(args[1])
+
+    def _handle_box_set_text_valign(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text_valign = str(args[1])
+
+    def _handle_box_set_text_size(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text_size = args[1]
+
+    def _handle_box_set_text_formatting(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text_formatting = str(args[1])
+
+    def _handle_box_set_text_wrap(self, args: list[Any]) -> None:
+        box = args[0] if args else None
+        if isinstance(box, Box) and len(args) > 1:
+            box.text_wrap = str(args[1])
+
+    def _handle_label_set_textalign(self, args: list[Any]) -> None:
+        """label.set_textalign — alias of set_text_halign."""
+        label = args[0] if args else None
+        if isinstance(label, Label) and len(args) > 1:
+            label.text_halign = str(args[1])
+
+    def _handle_label_set_size(self, args: list[Any]) -> None:
+        label = args[0] if args else None
+        if isinstance(label, Label) and len(args) > 1:
+            label.size = args[1]
+            label.text_size = args[1]
+
+    def _handle_label_set_point(self, args: list[Any]) -> None:
+        label = args[0] if args else None
+        point = args[1] if len(args) > 1 else None
+        if isinstance(label, Label) and isinstance(point, ChartPoint):
+            label.x = point.index if point.index is not None else (point.time or 0)
+            label.y = point.price
+
+    def _table_cell_at(self, table: Table, col: int, row: int) -> TableCell:
+        key = (int(col), int(row))
+        if key not in table.cells:
+            table.cells[key] = TableCell()
+        return table.cells[key]
+
+    def _handle_table_cell_set_width(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).width = val
+
+    def _handle_table_cell_set_height(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).height = val
+
+    def _handle_table_cell_set_text_halign(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).text_halign = str(val)
+
+    def _handle_table_cell_set_text_valign(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).text_valign = str(val)
+
+    def _handle_table_cell_set_text_size(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).text_size = val
+
+    def _handle_table_cell_set_text_font_family(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).text_font_family = str(val)
+
+    def _handle_table_cell_set_text_formatting(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).text_formatting = str(val)
+
+    def _handle_table_cell_set_tooltip(self, args: list[Any]) -> None:
+        table, col, row, val = (args + [None] * 4)[:4]
+        if isinstance(table, Table):
+            self._table_cell_at(table, col, row).tooltip = str(val)
+
+    def _handle_table_set_position(self, args: list[Any]) -> None:
+        table = args[0] if args else None
+        if isinstance(table, Table) and len(args) > 1:
+            table.position = str(args[1])
+
+    def _handle_table_set_bgcolor(self, args: list[Any]) -> None:
+        table = args[0] if args else None
+        if isinstance(table, Table) and len(args) > 1:
+            table.bgcolor = args[1]
+
+    def _handle_table_set_border_color(self, args: list[Any]) -> None:
+        table = args[0] if args else None
+        if isinstance(table, Table) and len(args) > 1:
+            table.border_color = args[1]
+
+    def _handle_table_set_border_width(self, args: list[Any]) -> None:
+        table = args[0] if args else None
+        if isinstance(table, Table) and len(args) > 1:
+            table.border_width = int(args[1])
+
+    def _handle_table_set_frame_color(self, args: list[Any]) -> None:
+        table = args[0] if args else None
+        if isinstance(table, Table) and len(args) > 1:
+            table.frame_color = args[1]
+
+    def _handle_table_set_frame_width(self, args: list[Any]) -> None:
+        table = args[0] if args else None
+        if isinstance(table, Table) and len(args) > 1:
+            table.frame_width = int(args[1])
+
+    def _handle_linefill_new(self, args: list[Any]) -> LineFill:
+        """Fill the region between two lines.
+
+        Signature: linefill.new(line1, line2, color)
+
+        ``line.fill`` is an alias of ``linefill.new``.
+        """
+        line1 = args[0] if len(args) > 0 else None
+        line2 = args[1] if len(args) > 1 else None
+        color = args[2] if len(args) > 2 else "rgba(0,0,0,0)"
+        fill = LineFill(
+            line1=line1 if isinstance(line1, Line) else None,
+            line2=line2 if isinstance(line2, Line) else None,
+            color=str(color),
+        )
+        return DrawingRegistry.add_linefill(fill)
+
+    def _handle_linefill_delete(self, args: list[Any]) -> None:
+        fill = args[0] if args else None
+        if isinstance(fill, LineFill):
+            fill.deleted = True
+
+    def _handle_linefill_set_color(self, args: list[Any]) -> None:
+        fill = args[0] if args else None
+        if isinstance(fill, LineFill) and len(args) > 1:
+            fill.color = str(args[1])
+
+    def _handle_linefill_get_line1(self, args: list[Any]) -> Line | None:
+        fill = args[0] if args else None
+        return fill.line1 if isinstance(fill, LineFill) else None
+
+    def _handle_linefill_get_line2(self, args: list[Any]) -> Line | None:
+        fill = args[0] if args else None
+        return fill.line2 if isinstance(fill, LineFill) else None

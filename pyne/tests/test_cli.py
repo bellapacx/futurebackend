@@ -1,0 +1,573 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""CLI smoke tests for ``pyne`` / ``pynescript`` Click entry point.
+
+CI-fast: no network, no ``pinescript_filepath`` / builtin corpus fixtures.
+Uses tiny inline Pine snippets under ``tmp_path`` only.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+from pathlib import Path
+
+import pytest
+
+from click.testing import CliRunner
+
+from pynescript import __version__
+from pynescript.__main__ import cli
+
+
+MINI = """//@version=5
+indicator("cli_smoke")
+plot(close)
+"""
+
+# Spacing / blanks that unparse canonicalizes away (format --check → exit 1).
+NEEDS_REFORMAT = """//@version=5
+
+
+indicator(  "cli_fmt"  )
+plot(  close  )
+
+
+"""
+
+
+@pytest.fixture
+def pine_file(tmp_path: Path) -> Path:
+    p = tmp_path / "smoke.pine"
+    p.write_text(MINI, encoding="utf-8")
+    return p
+
+
+@pytest.fixture
+def runner() -> CliRunner:
+    return CliRunner()
+
+
+def _combined(r) -> str:  # click.testing.Result
+    """Stdout + stderr + exception text (Click may put status on either stream)."""
+    parts = [r.output or "", getattr(r, "stderr", None) or "", str(r.exception or "")]
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Root / version / help
+# ---------------------------------------------------------------------------
+
+
+def test_root_help(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["--help"])
+    assert r.exit_code == 0
+    out = r.output
+    assert "check" in out
+    assert "compile" in out
+    assert "run" in out
+    assert "format" in out
+    assert "info" in out
+    assert "download-builtins" in out
+    assert "runner" in out
+    assert "mcp" in out
+    assert "execute" in out
+    assert "symbols" in out
+    assert "pyne check" in out
+    assert "pynescript remains a compatibility alias" in out
+    # Windows GH runners default to cp1252; Click --help must not use → / —.
+    out.encode("cp1252")
+
+
+def test_version_option(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["--version"])
+    assert r.exit_code == 0
+    # click.version_option message="%(version)s"
+    assert __version__ in r.output
+
+
+def test_version_short_option(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["-V"])
+    assert r.exit_code == 0
+    assert __version__ in r.output
+
+
+def test_no_subcommand_shows_help(runner: CliRunner) -> None:
+    r = runner.invoke(cli, [])
+    assert r.exit_code == 0
+    assert "Usage" in r.output or "Commands" in r.output or "check" in r.output
+
+
+# ---------------------------------------------------------------------------
+# check — exit codes, quiet, missing file, stdin
+# ---------------------------------------------------------------------------
+
+
+def test_check_ok(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["check", str(pine_file), "-q"])
+    assert r.exit_code == 0
+    # quiet: no per-file status noise
+    assert r.output.strip() == ""
+
+
+def test_check_ok_verbose(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["check", str(pine_file)])
+    assert r.exit_code == 0
+    assert "ok" in r.output.lower() or "✔" in r.output or str(pine_file) in r.output
+
+
+def test_check_fail(runner: CliRunner, tmp_path: Path) -> None:
+    bad = tmp_path / "bad.pine"
+    bad.write_text("//@version=5\nindicator(\n", encoding="utf-8")
+    r = runner.invoke(cli, ["check", str(bad), "-q"])
+    assert r.exit_code == 1
+
+
+def test_check_fail_verbose(runner: CliRunner, tmp_path: Path) -> None:
+    bad = tmp_path / "bad.pine"
+    bad.write_text("//@version=5\nindicator(\n", encoding="utf-8")
+    r = runner.invoke(cli, ["check", str(bad)])
+    assert r.exit_code == 1
+    low = _combined(r).lower()
+    assert "fail" in low or "✘" in _combined(r) or "error" in low or "failed" in low
+
+
+def test_check_missing_file(runner: CliRunner, tmp_path: Path) -> None:
+    missing = tmp_path / "does_not_exist.pine"
+    r = runner.invoke(cli, ["check", str(missing)])
+    assert r.exit_code != 0
+    assert "not found" in _combined(r).lower()
+
+
+def test_check_stdin(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["check", "-"], input=MINI)
+    assert r.exit_code == 0
+
+
+def test_check_stdin_quiet_bad(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["check", "-", "-q"], input="//@version=5\nindicator(\n")
+    assert r.exit_code == 1
+    assert r.output.strip() == ""
+
+
+def test_check_directory(runner: CliRunner, tmp_path: Path) -> None:
+    good = tmp_path / "a.pine"
+    good.write_text(MINI, encoding="utf-8")
+    (tmp_path / "skip.txt").write_text("not pine", encoding="utf-8")
+    r = runner.invoke(cli, ["check", str(tmp_path), "-q"])
+    assert r.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# parse / dump / format
+# ---------------------------------------------------------------------------
+
+
+def test_alias_dump(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["dump", str(pine_file)])
+    assert r.exit_code == 0
+    assert "Script" in r.output or "script" in r.output.lower() or "body" in r.output
+
+
+def test_dump_missing_file(runner: CliRunner, tmp_path: Path) -> None:
+    r = runner.invoke(cli, ["dump", str(tmp_path / "nope.pine")])
+    assert r.exit_code != 0
+
+
+def test_dump_stdin(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["dump", "-"], input=MINI)
+    assert r.exit_code == 0
+    assert len(r.output) > 10
+
+
+def test_format_check_already_formatted(runner: CliRunner, tmp_path: Path) -> None:
+    """Write via fmt -w first, then --check must exit 0."""
+    p = tmp_path / "fmt.pine"
+    p.write_text(MINI, encoding="utf-8")
+    w = runner.invoke(cli, ["fmt", str(p), "-w"])
+    assert w.exit_code == 0, w.output
+    r = runner.invoke(cli, ["format", str(p), "--check"])
+    assert r.exit_code == 0, r.output
+    assert "formatted" in r.output.lower() or "ok" in r.output.lower() or "✔" in r.output
+
+
+def test_format_check_needs_reformat(runner: CliRunner, tmp_path: Path) -> None:
+    p = tmp_path / "messy.pine"
+    p.write_text(NEEDS_REFORMAT, encoding="utf-8")
+    r = runner.invoke(cli, ["format", str(p), "--check"])
+    # Extra blanks / spacing differ from unparse canonical form
+    assert r.exit_code == 1, _combined(r)
+    low = _combined(r).lower()
+    assert "reformat" in low or "fail" in low or "✘" in _combined(r)
+
+
+def test_format_write(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["fmt", str(pine_file), "-w"])
+    assert r.exit_code == 0
+    text = pine_file.read_text(encoding="utf-8")
+    assert text.strip()
+    assert "indicator" in text
+
+
+def test_format_stdout(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["format", str(pine_file)])
+    assert r.exit_code == 0
+    assert "indicator" in r.output
+    assert "plot" in r.output
+
+
+def test_format_write_stdin_rejected(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["format", "-", "-w"], input=MINI)
+    assert r.exit_code != 0
+    low = _combined(r).lower()
+    assert "stdin" in low or "write" in low
+
+
+# ---------------------------------------------------------------------------
+# lint
+# ---------------------------------------------------------------------------
+
+
+def test_lint_clean(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["lint", str(pine_file), "--fail-on", "never"])
+    assert r.exit_code == 0
+
+
+def test_lint_json(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["lint", str(pine_file), "--json", "--fail-on", "never"])
+    assert r.exit_code == 0
+    payload = json.loads(r.output)
+    assert isinstance(payload, list)
+
+
+def test_lint_stdin(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["lint", "-", "--fail-on", "never", "-q"], input=MINI)
+    assert r.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# info
+# ---------------------------------------------------------------------------
+
+
+def test_info_json_shape(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["info", "--json"])
+    assert r.exit_code == 0
+    payload = json.loads(r.output)
+    assert payload["name"] == "pynescript"
+    assert payload.get("distribution") == "hoox-pyne"
+    assert payload["version"] == __version__
+    assert isinstance(payload["python"], str) and payload["python"]
+    assert isinstance(payload["platform"], str) and payload["platform"]
+    assert isinstance(payload["numba"], bool)
+    assert isinstance(payload["rich"], bool)
+    assert payload["entry_points"]["cli"] == "pyne"
+    assert payload["entry_points"]["cli_alias"] == "pynescript"
+    assert payload["entry_points"]["lsp"] == "pyne-lsp"
+    assert payload["entry_points"]["lsp_alias"] == "pynescript-lsp"
+    assert payload["entry_points"]["mcp"] == "pyne-mcp"
+    assert isinstance(payload["mcp"], bool)
+    assert "hoox.sh" in payload["docs"]
+
+
+def test_info_text(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["info"])
+    assert r.exit_code == 0
+    assert "pynescript" in r.output
+    assert "pyne" in r.output
+    assert __version__ in r.output or "version" in r.output.lower() or "package" in r.output.lower()
+
+
+def test_info_alias_ls(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["ls", "--json"])
+    assert r.exit_code == 0
+    assert json.loads(r.output)["name"] == "pynescript"
+
+
+def test_mcp_config_json(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["mcp", "config"])
+    assert r.exit_code == 0, r.output
+    payload = json.loads(r.output)
+    assert payload["mcpServers"]["pyne"]["command"] == "pyne-mcp"
+    r2 = runner.invoke(cli, ["mcp", "config", "--module"])
+    assert r2.exit_code == 0
+    payload2 = json.loads(r2.output)
+    assert payload2["mcpServers"]["pyne"]["args"] == ["-m", "pynescript.mcp"]
+
+
+def test_mcp_help(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["mcp", "--help"])
+    assert r.exit_code == 0
+    assert "config" in r.output
+    assert "tools" in r.output
+    assert "call" in r.output
+
+
+def test_mcp_tools_list(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["mcp", "tools"])
+    assert r.exit_code == 0, r.output
+    assert "pyne_lint" in r.output
+    assert "pyne_execute" in r.output
+    r2 = runner.invoke(cli, ["mcp", "tools", "--json"])
+    assert r2.exit_code == 0
+    names = json.loads(r2.output)
+    assert "pyne_execute" in names
+    assert "pyne_parity" in names
+
+
+def test_mcp_call_lint_and_builtin(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["mcp", "call", "lint", str(pine_file)])
+    assert r.exit_code == 0, r.output
+    payload = json.loads(r.output)
+    assert payload["ok"] is True
+    assert isinstance(payload["findings"], list)
+    b = runner.invoke(cli, ["mcp", "call", "builtin", "--name", "ta.sma"])
+    assert b.exit_code == 0, b.output
+    hit = json.loads(b.output)
+    assert hit["ok"] is True
+    assert hit["name"] == "ta.sma"
+
+
+def test_mcp_call_execute(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(
+        cli,
+        ["mcp", "call", "execute", str(pine_file), "--arg", "bars=16", "--arg", "mode=interpret", "--arg", "sample=4"],
+    )
+    assert r.exit_code == 0, r.output
+    payload = json.loads(r.output)
+    assert payload["ok"] is True
+    assert payload["bars"] == 16
+    assert payload["plots"]
+
+
+def test_mcp_call_unknown_tool(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["mcp", "call", "not-a-real-tool"])
+    assert r.exit_code == 1
+    payload = json.loads(r.output)
+    assert payload["ok"] is False
+    assert payload["kind"] == "io"
+
+
+def test_mcp_call_lint_fails_on_errors(runner: CliRunner, tmp_path: Path) -> None:
+    """``pyne lint`` exits non-zero on errors — the MCP call path must match."""
+    bad = tmp_path / "bad.pine"
+    bad.write_text('//@version=6\nindicator("bad"\nplot(close)\n', encoding="utf-8")
+    r = runner.invoke(cli, ["mcp", "call", "lint", str(bad)])
+    assert r.exit_code == 1, r.output
+    payload = json.loads(r.output)
+    assert payload["error_count"] >= 1
+
+
+def test_execute_cmd(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["execute", str(pine_file), "--bars", "16", "--mode", "interpret"])
+    assert r.exit_code == 0, r.output
+    payload = json.loads(r.output)
+    assert payload["ok"] is True
+    assert payload["bars"] == 16
+    assert payload["plots"]
+    assert "compile_ms" not in payload["plots"]
+
+
+def test_execute_cmd_parse_error(runner: CliRunner, tmp_path: Path) -> None:
+    bad = tmp_path / "bad.pine"
+    bad.write_text('//@version=6\nindicator("bad"\nplot(close)\n', encoding="utf-8")
+    r = runner.invoke(cli, ["execute", str(bad), "--mode", "interpret", "--bars", "8"])
+    assert r.exit_code == 1
+    payload = json.loads(r.output)
+    assert payload["ok"] is False
+
+
+def test_symbols_and_diagnostics_cmd(runner: CliRunner, pine_file: Path) -> None:
+    s = runner.invoke(cli, ["symbols", str(pine_file)])
+    assert s.exit_code == 0, s.output
+    outline = json.loads(s.output)
+    assert outline["ok"] is True
+    assert {item["kind"] for item in outline["symbols"]} >= {"plot"}
+    d = runner.invoke(cli, ["diagnostics", str(pine_file)])
+    assert d.exit_code == 0, d.output
+    diag = json.loads(d.output)
+    assert diag["ok"] is True
+    assert isinstance(diag["diagnostics"], list)
+
+
+def test_parity_and_builtin_cmd(runner: CliRunner, tmp_path: Path) -> None:
+    pine = tmp_path / "sma.pine"
+    pine.write_text('//@version=6\nindicator("sma")\nplot(ta.sma(close, 5))\n', encoding="utf-8")
+    p = runner.invoke(cli, ["parity", str(pine), "--bars", "24"])
+    assert p.exit_code == 0, p.output
+    payload = json.loads(p.output)
+    assert payload["ok"] is True
+    assert payload["match"] is True
+    b = runner.invoke(cli, ["builtin", "ta.sma"])
+    assert b.exit_code == 0, b.output
+    hit = json.loads(b.output)
+    assert hit["ok"] is True
+    assert hit["name"] == "ta.sma"
+    miss = runner.invoke(cli, ["builtin", "not.a.real.builtin.zzz"])
+    assert miss.exit_code == 1
+    assert json.loads(miss.output)["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# compile / run — no network; graceful without numba
+# ---------------------------------------------------------------------------
+
+
+def test_compile_emit(runner: CliRunner, pine_file: Path) -> None:
+    """``--emit`` is transpile-only and must work without numba."""
+    r = runner.invoke(cli, ["compile", str(pine_file), "--emit", "--no-time"])
+    assert r.exit_code == 0, r.output
+    assert "execute" in r.output or "def " in r.output
+
+
+def test_compile(runner: CliRunner, pine_file: Path) -> None:
+    """Full compile: ok with or without numba; failures must be graceful (exit 1 + message)."""
+    r = runner.invoke(cli, ["compile", str(pine_file), "--no-time"])
+    combined = _combined(r)
+    if r.exit_code == 0:
+        low = combined.lower()
+        assert "compiled" in low or "ok" in low or "mode=" in low or "✔" in combined
+    else:
+        # Graceful failure path (e.g. numeric mode without numba)
+        assert r.exit_code == 1
+        assert combined.strip(), "expected error message, not empty failure"
+        # Should not dump a raw Python traceback as the only signal
+        assert "Traceback (most recent call last)" not in combined or "numba" in combined.lower()
+
+
+def test_run(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["run", str(pine_file), "--bars", "16", "--json"])
+    combined = _combined(r)
+    if r.exit_code == 0:
+        payload = json.loads(r.output)
+        assert payload["bars"] == 16
+        assert "plots" in payload
+        assert isinstance(payload["plots"], dict)
+    else:
+        # Same grace rule as compile when numba is absent for pure-numeric scripts
+        assert r.exit_code == 1
+        assert combined.strip()
+
+
+def test_run_bad_bars(runner: CliRunner, pine_file: Path) -> None:
+    r = runner.invoke(cli, ["run", str(pine_file), "--bars", "1"])
+    assert r.exit_code != 0
+    assert "bars" in _combined(r).lower()
+
+
+# ---------------------------------------------------------------------------
+# data — mock only (no network)
+# ---------------------------------------------------------------------------
+
+
+def test_data_mock(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["data", "AAPL", "--provider", "mock"])
+    assert r.exit_code == 0, r.output
+    assert "bars" in r.output.lower() or "close" in r.output.lower() or "AAPL" in r.output
+
+
+def test_data_mock_json(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["data", "AAPL", "--provider", "mock", "--format", "json"])
+    assert r.exit_code == 0, r.output
+    payload = json.loads(r.output)
+    assert payload["provider"] == "mock"
+    assert payload["bars"] > 0
+    assert len(payload["close"]) == payload["bars"]
+
+
+def test_data_does_not_use_network_providers_in_suite() -> None:
+    """Guard: this module must never invoke non-mock data providers."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    for line in src.splitlines():
+        if "invoke" not in line:
+            continue
+        assert not re.search(r"--provider[\"',\s]+(yahoo|ccxt|alphavantage)", line)
+        if "--provider" in line:
+            assert "mock" in line
+
+
+# ---------------------------------------------------------------------------
+# Unknown command
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_command(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["this-command-does-not-exist-xyz"])
+    assert r.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# runner -- HTTP client for Flask hosted runner (mocked, no network)
+# ---------------------------------------------------------------------------
+
+
+def test_runner_help(runner: CliRunner) -> None:
+    r = runner.invoke(cli, ["runner", "--help"])
+    assert r.exit_code == 0, r.output
+    out = r.output
+    assert "deploy" in out
+    assert "tick" in out
+    assert "list" in out
+    out.encode("cp1252")
+
+
+def test_runner_deploy_and_tick(runner: CliRunner, pine_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def fake_api(url: str, method: str, path: str, **kwargs: object) -> dict:
+        body = kwargs.get("body") if isinstance(kwargs.get("body"), dict) else None
+        calls.append((method, path, body))
+        if method == "POST" and path == "/scripts":
+            sid = body.get("id") if body else ""
+            return {"status": "success", "script": {"id": sid, "data_source": "mock", "enabled": True}}
+        if method == "POST" and path == "/cron/run":
+            job = {"script_id": "demo", "status": "ok", "mode": "interpret"}
+            return {"status": "success", "jobs": [job]}
+        return {"status": "success"}
+
+    monkeypatch.setattr("pynescript.util.runner_cli.api_request", fake_api)
+
+    r = runner.invoke(cli, ["runner", "deploy", str(pine_file), "--id", "demo", "--source", "mock"])
+    assert r.exit_code == 0, r.output
+    assert "deployed demo" in r.output
+    assert calls[0][0] == "POST"
+    assert calls[0][1] == "/scripts"
+    assert "indicator" in (calls[0][2] or {}).get("script", "")
+
+    r = runner.invoke(cli, ["runner", "tick", "--id", "demo", "--force"])
+    assert r.exit_code == 0, r.output
+    assert "demo" in r.output
+    assert calls[1][0] == "POST"
+    assert calls[1][1] == "/cron/run"
+    assert (calls[1][2] or {}).get("force") is True
+
+
+def test_runner_disabled_message(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    import click
+
+    def fake_api(*_a: object, **_k: object) -> dict:
+        msg = "Hosted runner is off. Set PYNE_RUNNER=1 on the API host."
+        raise click.ClickException(msg)
+
+    monkeypatch.setattr("pynescript.util.runner_cli.api_request", fake_api)
+    r = runner.invoke(cli, ["runner", "list"])
+    assert r.exit_code != 0
+    assert "PYNE_RUNNER=1" in (r.output + str(r.exception))

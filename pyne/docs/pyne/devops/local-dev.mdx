@@ -1,0 +1,157 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+title: "Local development"
+description: "Install, test, lint, package, and run PYNE — Make targets after AXIS extraction."
+---
+
+# Local development
+
+## Abstract
+
+A PYNE checkout is a **Python-first workspace**: src-layout package + Flask Pro API,
+optional VS Code extension (Node). PyneTS is the standalone [hoox-sh/pynets](https://github.com/hoox-sh/pynets) / `@hoox-sh/pynets` package. The AXIS
+charting PWA is a **sister repo** ([axis](https://github.com/hoox-sh/axis)) — do not recreate `frontend/` here.
+
+## Conceptual model
+
+```mermaid
+flowchart LR
+  SRC[src/pynescript] --> CLI[pyne CLI]
+  SRC --> LSP[pyne-lsp]
+  SRC --> LIB[import pynescript]
+  BE[backend/] --> API[Flask :5002]
+  VSC[vscode-extension/] --> VSIX[vsce package]
+  TS[hoox-sh/pynets] --> BUN[bun test]
+  DOCK[Dockerfile] --> IMG[api · cli · lsp]
+```
+
+## Interface surface
+
+### Make targets (primary)
+
+| Target | Effect |
+| --- | --- |
+| `make install` | `pip install -e ".[lsp,pro]"` |
+| `make test` | full `pytest tests/` |
+| `make test-cli` | `tests/test_cli.py` |
+| `make test-lsp` | langserver + lsp_features |
+| `make test-backend` | `tests/test_backend.py` |
+| `make lint` / `make fmt` | Ruff on `src/`, `tests/`, `backend/` |
+| `make package` | sdist + wheel (`python -m build`) |
+| `make build` | Nuitka **LSP** binary |
+| `make build-cli` | Nuitka **CLI** binary |
+| `make build-check` | import check for lsp+cli (~30s) |
+| `make build-vscode` | compile + package VSIX |
+| `make run` | Flask Pro API (`:5002` typical) |
+| `make run-lsp` | `python -m pynescript.langserver` |
+| `make docker-build` | bake **api** |
+| `make docker-build-cli` | bake **cli** |
+| `make docker-build-lsp` | bake **lsp** (`pynescript-lsp:latest`; GHCR name `ghcr.io/hoox-sh/pyne/lsp`) |
+| `make docker-build-all` | api + api-dev + lsp + cli |
+| `make docker-buildx` | multi-platform release bake (`api` + `cli` + `lsp`) |
+| `make docker-push-ghcr` | `gh workflow run ghcr.yml` |
+| `make docker-cli ARGS="…"` | compose profile cli (ephemeral) |
+| `make docker-up` | compose API on `:5002` |
+| `make docker-up-full` | + redis profile |
+| `make docker-prod` | gunicorn overlay (`ADMIN_TOKEN` required) |
+| `make docker-smoke` | curl health on `:5002` |
+| `make docker-down` / `docker-logs` | stop / logs |
+
+### Hatch
+
+```bash
+hatch run test:test
+hatch run test:test-cov
+hatch run lint:style
+hatch run lint:typing
+hatch run lint:gen-parser
+```
+
+### Quick desk loop
+
+```bash
+git clone https://github.com/hoox-sh/pyne.git
+cd pyne
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[lsp,compile,pro]"
+pyne info
+pyne check examples/rsi_strategy.pine
+make test-cli
+make run   # Pro API
+```
+
+### From PyPI (no checkout)
+
+```bash
+pip install "hoox-pyne[lsp,compile]"
+pyne --version   # 0.6.19
+```
+
+## Internals
+
+| Path | Why it matters |
+| --- | --- |
+| `src/pynescript/` | Editable package root |
+| `tests/conftest.py` | Optional `--example-scripts-dir` only; no third-party corpus shipped |
+| `backend/requirements.txt` | Pro API deps (also covered by `[pro]` extra) |
+| [hoox-sh/pynets](https://github.com/hoox-sh/pynets) | Standalone TS library (`@hoox-sh/pynets`); not an in-tree submodule |
+| `vscode-extension/` | PYNE VS Code extension |
+| `Dockerfile` | targets `api`, `api-dev`, `lsp`, **`cli`** |
+
+### Python
+
+- **Requires-Python:** `>=3.10`
+- **CI matrix:** 3.10–3.13
+- **Hatch test matrix:** 3.10–3.12 (no 3.13 cell)
+- **Recommended:** 3.12+ with venv
+
+### Optional extras
+
+| Extra | Adds |
+| --- | --- |
+| `lsp` | pygls / lsprotocol → `pyne-lsp` (alias `pynescript-lsp`) |
+| `compile` | numpy / numba |
+| `data` / `datafeed` | ccxt |
+| `pro` | Flask + gunicorn + matplotlib + redis + compile |
+
+## Invariants
+
+1. **No `frontend/` in this repo** — AXIS is external.
+2. **`from __future__ import annotations`** required on new Python modules.
+3. **Grammar edits** only under `resource/`; regenerate via hatch, don’t hand-edit generated parser.
+4. **Corpus fixture** runs hundreds of cases — prefer focused unit tests for CI paths.
+5. **CLI Docker** runs as uid 1000; bind-mounts must be readable by others.
+
+## Failure modes
+
+| Symptom | Fix |
+| --- | --- |
+| `No module named pynescript` | activate venv; `pip install -e .` or `hoox-pyne` |
+| Pro API ImportError flask | `pip install "hoox-pyne[pro]"` or backend requirements |
+| Nuitka missing | `pip install nuitka`; `make build-check` first |
+| Docker CLI can’t read file | chmod host path; don’t use 0700-only dirs |
+
+## See also
+
+- [Installation](/pyne/docs/enduser/getting-started/installation)
+- [CI](/pyne/docs/devops/ci)
+- [Docker](/pyne/docs/devops/docker)
+- [Nuitka build](/pyne/docs/devops/nuitka-build)

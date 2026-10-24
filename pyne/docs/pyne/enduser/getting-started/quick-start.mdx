@@ -1,0 +1,283 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+title: "Quick Start"
+description: "Parse, dump, unparse, lint, and evaluate Pine Script™ with the pyne CLI and library in under ten minutes."
+---
+
+# Quick Start
+
+## Abstract
+
+This page is a linear path from a working install to the five desk operations most users need: **parse**, **dump**, **unparse**, **lint**, and **evaluate**. Full option trees live in [CLI commands](/pyne/docs/enduser/reference/cli-commands); deeper evaluation semantics live in [Evaluate scripts](/pyne/docs/enduser/guides/evaluate-scripts).
+
+## Conceptual model
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant CLI as pyne CLI
+  participant AST as ASDL AST
+  participant EV as literal_eval / Runtime
+  U->>CLI: parse-and-dump script.pine
+  CLI->>AST: parse(source)
+  AST-->>CLI: tree
+  CLI-->>U: dump text
+  U->>CLI: parse-and-unparse
+  CLI->>AST: parse + unparse
+  AST-->>U: normalized .pine
+  U->>CLI: lint
+  CLI-->>U: LintWarning list
+  U->>EV: literal_eval / Runtime.run
+  EV-->>U: values / plots / events
+```
+
+## Interface surface
+
+Assumes:
+
+```bash
+pip install hoox-pyne                 # https://pypi.org/project/hoox-pyne/ · 0.6.19
+# optional:
+# pip install "hoox-pyne[lsp]"        # editors
+# pip install "hoox-pyne[compile]"    # compile / run / prewarm
+# pip install "hoox-pyne[data]"       # ccxt providers
+# pip install "hoox-pyne[mcp]"        # stdio pyne-mcp; pyne execute / mcp call need no extra
+```
+
+```bash
+pyne info
+pyne check script.pine
+pyne lint script.pine
+# aliases still work: pynescript info …
+# hoox-pyne 0.6.14 (live on PyPI)
+```
+
+Sample script in-tree: `examples/rsi_strategy.pine`. Prefer **`//@version=6`** and **`.pyne`** / **`.pine`** for new work (`.pinev5` remains a supported legacy association).
+
+## Internals (repo paths)
+
+| Step | Implementation |
+| --- | --- |
+| CLI parse/dump | `src/pynescript/__main__.py` → `parse_and_dump` |
+| CLI unparse | `parse_and_unparse` |
+| CLI lint | `lint` → `pynescript.ast.linter.lint_script` |
+| Library helpers | `src/pynescript/ast/helper.py` |
+| Bar-loop Runtime SoT | `src/pynescript/runtime/` (`from pynescript.runtime import Runtime`) |
+| Example scripts | `examples/parse_dump_unparse.py`, `examples/evaluate_expressions.py` |
+
+## Invariants & edge cases
+
+- Always declare **`//@version=6`** at the top (v5 still parses); the linter warns (`W001`) if the pragma is missing.
+- `parse-and-unparse` is a **formatter via AST**, not a semantic optimizer.
+- `literal_eval` is for expressions / built-in calls with optional series context — not a full multi-bar strategy backtester. For bar loops, use `pynescript.runtime.Runtime` (or the Pro API `/run`).
+- Filename arguments to the CLI must exist and be readable; lint may also read stdin (`-` or no file).
+
+## Worked examples
+
+### 1. Parse and dump the AST
+
+```bash
+pyne parse-and-dump examples/rsi_strategy.pine
+```
+
+Pretty-print with indent and optional file output:
+
+```bash
+pyne parse-and-dump examples/rsi_strategy.pine --indent 2 --output-file /tmp/rsi.ast.txt
+```
+
+Library equivalent:
+
+```python
+from pynescript.ast import parse, dump
+
+with open("examples/rsi_strategy.pine", encoding="utf-8") as f:
+    tree = parse(f.read(), "examples/rsi_strategy.pine")
+print(dump(tree, indent=2))
+```
+
+### 2. Round-trip unparse (normalize)
+
+```bash
+pyne parse-and-unparse examples/rsi_strategy.pine
+pyne parse-and-unparse messy.pine --output-file clean.pine
+```
+
+```python
+from pynescript.ast import parse, unparse
+
+source = """
+//@version=6
+indicator("My RSI")
+rsi(close, 14)
+"""
+print(unparse(parse(source)))
+```
+
+Canonical demo: `examples/parse_dump_unparse.py`.
+
+### 3. Lint before upload
+
+```bash
+pyne lint examples/rsi_strategy.pine
+pyne lint --fail-on warnings examples/rsi_strategy.pine
+echo '//@version=6\nindicator("x")\nplot(close)' | pyne lint -
+```
+
+Library:
+
+```python
+from pynescript.ast.linter import lint_script
+
+issues = lint_script(open("examples/rsi_strategy.pine").read(), "rsi_strategy.pine")
+for w in issues:
+    print(w)  # severity: [CODE] message at line N
+```
+
+### 4. Evaluate expressions
+
+```python
+from pynescript.ast.helper import literal_eval
+
+print(literal_eval("1 + 2 * 3"))  # 7
+print(literal_eval("math.sqrt(16)"))
+prices = [100, 102, 101, 103, 105, 104, 106, 108, 107, 110]
+print(literal_eval(f"ta.rsi({prices}, 9)"))
+
+# Series history with context
+ctx = {
+    "close": [100, 102, 101, 103, 105],
+    "open": [99, 101, 100, 102, 104],
+}
+print(literal_eval("close[0] - close[1]", ctx))
+```
+
+Broader demo: `examples/evaluate_expressions.py`.
+
+### 5. Fetch sample market data (CLI)
+
+```bash
+# mock provider (no network)
+pyne data AAPL --provider mock
+
+# Yahoo (network)
+pyne data AAPL --provider yahoo --period 6mo --interval 1d
+
+# CCXT (needs hoox-pyne[data])
+pyne data BTC/USDT --provider ccxt --exchange binance
+```
+
+### 6. Optional: local Pro API `/run`
+
+```bash
+# from monorepo with backend deps
+make run
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:5002/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "script": "//@version=6\nindicator(\"t\")\nplot(close)",
+    "mode": "auto",
+    "data": [
+      {"time": 1, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 100},
+      {"time": 2, "open": 1.5, "high": 2.5, "low": 1.0, "close": 2.0, "volume": 120}
+    ]
+  }' | python -m json.tool
+```
+
+Omit `mode` to use the schema default **`auto`** (warm compile when eligible, else interpret). Response may include `series`, `plot_meta`, `events`, `drawings`, and `alerts`. See [Pro API usage](/pyne/docs/enduser/guides/pro-api-usage) for batch mode, webhooks, free-tier guards, and prewarm.
+
+Prefer saving stack sources as **`.pyne`** (`.pine` still works).
+
+### 7. Library bar-loop vs CLI smoke
+
+Library `Runtime.run` defaults to **interpret**. `pyne run` is **compile-only** on synthetic bars and does not accept `--mode`. `pyne execute` is the CLI `Runtime.run` path (`--mode interpret|compile|auto`).
+
+```python
+from pynescript.runtime import Runtime
+
+ohlcv = [
+    {"time": 1, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 100},
+    {"time": 2, "open": 1.5, "high": 2.5, "low": 1.0, "close": 2.0, "volume": 120},
+]
+out = Runtime(symbol="DEMO").run(
+    '//@version=6\nindicator("t")\nplot(close)\n',
+    ohlcv,
+    mode="interpret",
+    timeout_seconds=5.0,
+)
+print(out.get("mode"), list(out.get("series", {})))
+```
+
+```bash
+pip install "hoox-pyne[compile]"
+pyne run examples/rsi_strategy.pine --bars 50
+pyne execute examples/rsi_strategy.pine --mode interpret --bars 50
+```
+
+See [modes](/pyne/docs/enduser/reference/modes).
+
+### 8. Optional: MCP tools from the CLI
+
+`pyne mcp call` and `pyne execute` need no extra. Serving stdio to an LLM host does.
+
+```bash
+pyne mcp tools
+pyne mcp call lint examples/rsi_strategy.pine
+pyne mcp call execute examples/rsi_strategy.pine --arg bars=50 --arg mode=interpret
+# pip install "hoox-pyne[mcp]"
+# pyne mcp config && pyne mcp
+```
+
+See [MCP (agents)](/pyne/docs/enduser/guides/mcp).
+
+### 9. Optional: start LSP for editors
+
+```bash
+pip install "hoox-pyne[lsp]"
+pyne-lsp   # stdio; normally launched by the editor
+# alias: pynescript-lsp
+```
+
+Wire Neovim / Zed / Emacs using [Editors](/pyne/docs/enduser/guides/editors) and `clients/`.
+
+## Failure modes
+
+| Step fails | Check |
+| --- | --- |
+| Dump raises `SyntaxError` | Script version / unsupported construct — try a minimal `indicator` + `plot(close)` |
+| Unparse output differs cosmetically | Expected; compare semantic structure via dump |
+| Lint exits non-zero | `--fail-on` threshold; inspect codes `E001`, `W001`, … |
+| `literal_eval` `NotImplementedError` | Expression not in literal/builtin subset; use full Runtime |
+| `data` provider error | Network, API key, missing `ccxt` extra |
+
+## See also
+
+- [Installation](/pyne/docs/enduser/getting-started/installation)
+- [Configuration](/pyne/docs/enduser/getting-started/configuration)
+- [CLI guide](/pyne/docs/enduser/guides/cli)
+- [Library API](/pyne/docs/enduser/guides/library-api)
+- [Evaluate scripts](/pyne/docs/enduser/guides/evaluate-scripts)
+- [Runtime modes](/pyne/docs/enduser/reference/modes)
+- [CLI command reference](/pyne/docs/enduser/reference/cli-commands)
+- [MCP (agents)](/pyne/docs/enduser/guides/mcp)

@@ -1,0 +1,42 @@
+# Dependabot version updates + security PRs (roadmap hygiene).
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+  - package-ecosystem: npm
+    directory: /vscode-extension
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    ignore:
+      # vsce requires @types/vscode <= engines.vscode (^1.91.0 for
+      # vscode-languageclient 10). A caret range here resolves to latest
+      # and fails `vsce package`.
+      - dependency-name: "@types/vscode"
+  - package-ecosystem: npm
+    directory: /cf
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies

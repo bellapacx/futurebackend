@@ -1,0 +1,148 @@
+# Copyright (C) 2024-2026 jango_blockchained
+#
+# This file is part of pynescript.
+#
+# pynescript is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# pynescript is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with pynescript.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+title: "PYNE Documentation"
+description: "Open-source Pine Script™ evaluation — grammar, AST, interpret/compile runtime, alerts + webhooks, LSP, Pro API. pip install hoox-pyne · github.com/hoox-sh/pyne"
+---
+
+import { PackageVersions } from "/snippets/package-versions.jsx"
+
+# PYNE Documentation
+
+**PYNE** is the open evaluation stack for TradingView® Pine Script™: a formal ANTLR4 grammar, an ASDL algebraic AST, a deterministic bar-loop evaluator (interpret / compile / `mode=auto`), a Language Server Protocol surface, a Flask Pro API, and edge workers that share one evaluate contract — including **alerts** and optional **L2 webhooks**.
+
+For **natural-language authoring** (PYNE Agent), see the sister project **[pyne-agent-worker](/pyne/docs/agent)** — standalone Cloudflare® Workers AI™ agent with optional AXIS plugin; does not require pyne-worker.
+
+_Pine Script™ and TradingView® are trademarks of TradingView, Inc. This project is independent and not affiliated with or endorsed by TradingView, Inc. Cloudflare® is a trademark of Cloudflare, Inc._
+
+## Abstract
+
+Where closed hosts couple the language to a proprietary charting host, PYNE treats the language as an inspectable pipeline:
+
+```
+Source (.pyne / .pine)
+  → ANTLR4 lexer/parser (resource grammar)
+  → ASDL AST (builder)
+  → bar-loop (interpret | compile | auto)
+  → plots / fill / events / drawings / alerts
+  → optional L2 webhooks (Pro API + edge)
+```
+
+**Live on PyPI** as **[`hoox-pyne`](https://pypi.org/project/hoox-pyne/)** (`import pynescript`). Source: [github.com/hoox-sh/pyne](https://github.com/hoox-sh/pyne).
+
+```bash
+pip install "hoox-pyne[lsp]"
+pyne --version
+# aliases: pynescript / pynescript-lsp
+```
+
+<PackageVersions />
+
+The same pipeline powers the desk CLI, the LSP binary, the Pro API, browser Pyodide (via AXIS), and Cloudflare® workers. Round-trip fidelity (`parse → unparse`) and interpret↔compile [plot parity](/pyne/docs/runtime/compiler/parity) are first-class invariants — see [compatibility](/pyne/docs/reference/compatibility). Local open-corpus set01–04 (2026-08-09): **parse 99.96%**, **Runtime interpret 100% excl. intentional demos** (set01 **249/249**). The repository does not ship third-party script corpora.
+
+TypeScript consumers import **[PyneTS](/pyne/docs/pynets)** (`@hoox-sh/pynets`) — same public names; Python remains the oracle.
+
+Release notes: [GitHub releases](https://github.com/hoox-sh/pyne/releases) · [compatibility](/pyne/docs/reference/compatibility).
+
+## How to use
+
+| Surface | Role | Start here |
+| --- | --- | --- |
+| **Library + CLI** | Parse, lint, unparse, evaluate. Library `Runtime.run` defaults to **interpret**; `pyne execute` is CLI `Runtime.run`; `pyne run` is **compile-only** smoke | [End User hub](/pyne/docs/enduser) · [modes](/pyne/docs/enduser/reference/modes) |
+| **Language core** | Grammar, AST, visitors, type system | [Core](/pyne/docs/core) |
+| **Runtime** | Series caps, builtins, strategy, alerts, compiler parity | [Runtime](/pyne/docs/runtime) |
+| **LSP** | Diagnostics, completion, hover, format (`.pyne` / `.pine`) | [LSP](/pyne/docs/lsp) |
+| **MCP** | Stdio `pyne-mcp` plus in-process `pyne mcp call` / `pyne execute` — parse, lint, convert, compile, `Runtime.run`, builtins | [MCP](/pyne/docs/enduser/guides/mcp) |
+| **Pro API** | HTTP `/run` (alerts + L2 webhooks), `/optimize`, preview, backtest | [API](/pyne/docs/api) |
+| **Ops** | CI, Docker, Nuitka, self-host | [DevOps](/pyne/docs/devops) |
+| **PyneTS** | TypeScript / Bun library (`parse` / `unparse` / `Runtime.run`) | [PyneTS](/pyne/docs/pynets) |
+| **AXIS** (separate product) | Charting PWA AXIS | [AXIS docs](/axis/docs) |
+| **HOOX** | Edge trade mesh | [HOOX docs](/docs) |
+
+## Conceptual model
+
+```mermaid
+flowchart LR
+  S[Pine source] --> P[ANTLR4 parse]
+  P --> A[ASDL AST]
+  A --> E[Bar-loop interpret/compile]
+  A --> L[LSP features]
+  A --> U[Unparser]
+  E --> R[Plots / fill / events / alerts]
+  E --> API[Pro API / workers]
+  R --> WH[L2 webhooks]
+  R --> AXIS[AXIS optional]
+  R --> HOOX[HOOX trade-worker]
+```
+
+**Invariant:** evaluation never requires a proprietary chart host. AXIS is an optional chart; HOOX is an optional *execution mesh*.
+
+## Tracks
+
+### End User
+
+Install the package (`pip install hoox-pyne`), run the CLI, embed the library API, wire an editor (`.pyne` / `.pine`), or call the Pro API as a consumer — including alerts export and webhooks.
+
+→ [End User hub](/pyne/docs/enduser)
+
+### Core / Runtime / LSP / API
+
+Contributor and systems manuals: how the front-end, semantics, editor protocol, and HTTP bridge are built. Runtime covers series caps, incremental TA, drawing GC, `fill()` export, `request.security` HTF resample + barmerge (foreign/complex → `na`), strategy [optimize](/pyne/docs/api/endpoints/optimize), and [parity](/pyne/docs/runtime/compiler/parity).
+
+### DevOps
+
+CI matrices, Fernet metadata encryption, Nuitka LSP binaries, containers.
+
+→ [DevOps hub](/pyne/docs/devops)
+
+### Reference
+
+Compatibility guarantees, missing surface, numerical validation, [PyneTS](/pyne/docs/pynets), [ecosystem map](/pyne/docs/reference/ecosystem), [roadmap](/pyne/docs/reference/roadmap).
+
+## Sister surfaces
+
+- **PyneTS** — TypeScript / Bun library. Standalone [hoox-sh/pynets](https://github.com/hoox-sh/pynets) / `@hoox-sh/pynets`. See [PyneTS](/pyne/docs/pynets).
+- **[pyne-worker](/pyne/docs/pyne-worker)** (sister repo) — Python Cloudflare® Worker for production `POST /run` (alerts + cron + R2).
+- **[pyne-agent-worker](/pyne/docs/agent)** (sister repo) — NL authoring host (`POST /v1/chat`); optional validate via pyne-worker.
+- **AXIS** — installable PWA; documented at [hoox.sh/axis/docs](/axis/docs).
+- **Family map** — [Ecosystem](/pyne/docs/reference/ecosystem) · [modes](/pyne/docs/enduser/reference/modes).
+
+## Offline & agent exports
+
+Auto-generated like HOOX manuals (`bun run docs:exports`):
+
+| Kind | Path |
+| --- | --- |
+| Full-corpus LLM pack | [`llm.txt`](/pyne/docs/llm.txt) |
+| LLM site map ([llmstxt.org](https://llmstxt.org/)) | [`llms.txt`](/pyne/docs/llms.txt) |
+| Track PDFs (A4) | [`/exports/pyne-*-manual.pdf`](/exports/manifest.json) |
+
+## See also
+
+- [Installation](/pyne/docs/enduser/getting-started/installation)
+- [Quick start](/pyne/docs/enduser/getting-started/quick-start)
+- [Runtime modes](/pyne/docs/enduser/reference/modes)
+- [Alerts & webhooks](/pyne/docs/runtime/alerts)
+- [Grammar pipeline](/pyne/docs/core/grammar-antlr4)
+- [Evaluate contract](/pyne/docs/api/contract)
+- [POST /optimize](/pyne/docs/api/endpoints/optimize)
+- [pyne-worker](/pyne/docs/pyne-worker)
+- [pyne-agent-worker](/pyne/docs/agent)
+- [Roadmap](/pyne/docs/reference/roadmap)

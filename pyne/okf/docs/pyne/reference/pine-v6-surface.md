@@ -1,0 +1,43 @@
+---
+type: "Document"
+title: "Pine v6 surface inventory"
+description: "Summary of the full Pine Script™ v6 surface inventory — dispatch counts, namespaces, status schema — with pointer to the large source document. hoox-pyne 0.6.19."
+resource: "docs/pyne/reference/pine-v6-surface.mdx"
+tags: [doc, docs, pyne, reference]
+status: stable
+generated:
+  by: process:axis-okf/1
+  at: 2026-10-23T17:51:55Z
+sources:
+  - id: tree
+    resource: "docs/pyne/reference/pine-v6-surface.mdx"
+    title: "docs/pyne/reference/pine-v6-surface.mdx"
+    author: process:git
+okf_lock: generated
+---
+
+# Source
+
+Repo path `docs/pyne/reference/pine-v6-surface.mdx`.
+
+# Outline
+
+* Abstract
+* Conceptual model
+* Interface surface
+  * Status schema
+  * Summary counts (2026-10-08)
+  * Top namespaces by dispatch keys
+  * Kinds covered
+* Internals
+  * How to use the full file
+* Invariants & edge cases
+* Worked examples
+  * Quote coverage honestly
+  * Programmatic check (sketch)
+* Failure modes
+* See also
+
+# Mentions
+
+* [scripts](/code/scripts.md)

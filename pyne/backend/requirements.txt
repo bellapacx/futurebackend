@@ -1,0 +1,23 @@
+flask>=3.0.0
+flask-cors>=4.0.0
+flask-sock>=0.7.0
+simple-websocket>=1.0.0
+# .env support for `python -m backend.app` / gunicorn (optional at runtime)
+python-dotenv>=1.0.0
+numpy>=1.26.0
+# Compile mode (Runtime.run mode=compile|auto) — required for AXIS Execution mode
+numba>=0.59.0
+matplotlib>=3.8.0
+gunicorn>=21.0.0
+# Optional async workers. The API image defaults to `gthread` because the WS
+# routes are flask-sock, which upgrades by hijacking gunicorn.socket; these
+# stay available for an explicit GUNICORN_WORKER_CLASS=gevent override. Do not
+# use geventwebsocket.gunicorn.workers.GeventWebSocketWorker — its handler
+# upgrades the socket itself and flask-sock then re-frames it, so an HTTP error
+# body lands where a WS frame belongs (clients report "Invalid frame header").
+gevent>=24.0.0
+gevent-websocket>=0.10.1
+# Optional key-store backend (compose profile redis / REDIS_URL)
+redis>=5.0.0
+# Exchange datafeed (/datafeed/*, /data/series/fetch, /data/session tick) — CCXT
+ccxt>=4.0.0

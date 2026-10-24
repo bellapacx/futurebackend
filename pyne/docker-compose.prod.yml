@@ -1,0 +1,64 @@
+# Copyright (C) 2024-2026 jango_blockchained
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Production-ish overlay for the Pro API.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+#
+# No source mounts (volumes: !override); gunicorn via target `api`; tighter limits.
+# Multi-worker key store defaults to SQLite on the shared /data volume.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+      args:
+        PYNESCRIPT_VERSION: ${PYNESCRIPT_VERSION:-0.6.7}
+        GIT_SHA: ${GIT_SHA:-unknown}
+    image: pynescript-api:${TAG:-latest}
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      FLASK_ENV: production
+      FLASK_DEBUG: "0"
+      # sqlite is multi-worker safe on a shared volume; use redis for multi-host
+      STORE_BACKEND: ${STORE_BACKEND:-sqlite}
+      API_KEY_STORE: /data/api_keys.json
+      API_KEY_STORE_SQLITE: /data/api_keys.db
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://hoox.sh,https://hoox.sh/axis,https://pynescript.ai,https://app.pynescript.ai}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN must be set for production compose}
+      # Only set when STORE_BACKEND=redis (and redis profile / Memorystore is up)
+      REDIS_URL: ${REDIS_URL:-}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-1} # 1 = live sessions stay correct (see entrypoint-api.sh)
+      # Hard-pin gthread: flask-sock hijacks gunicorn.socket. A leftover
+      # GUNICORN_WORKER_CLASS=geventwebsocket… from 0.6.11 corrupts WS frames
+      # after a successful 101. Do not interpolate this from the host .env.
+      GUNICORN_WORKER_CLASS: gthread
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-100}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+      # Live WS holds a worker open; 500 recycled it too often (journal rebuild).
+      GUNICORN_MAX_REQUESTS: ${GUNICORN_MAX_REQUESTS:-5000}
+      GUNICORN_MAX_REQUESTS_JITTER: ${GUNICORN_MAX_REQUESTS_JITTER:-200}
+      # Public hosts: opt in to unauthenticated /run caps. Override with 0 to disable.
+      FREE_TIER_LIMITS: ${FREE_TIER_LIMITS:-1}
+      PYTHONPATH: /app/src:/app
+      # Optional: PYNE_RUNNER=1 PYNE_RUNNER_SCHEDULER=1 (prefer GUNICORN_WORKERS=1)
+      PYNE_RUNNER: ${PYNE_RUNNER:-0}
+      PYNE_RUNNER_SCHEDULER: ${PYNE_RUNNER_SCHEDULER:-0}
+      PYNE_RUNNER_POLL_SECONDS: ${PYNE_RUNNER_POLL_SECONDS:-60}
+      PYNE_RUNNER_DB: /data/runner.db
+    # Compose merges volumes by mount *target*; !override replaces the base
+    # list so ./src and ./backend binds from docker-compose.yml are dropped.
+    volumes: !override
+      - api_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: ${API_MEM_LIMIT:-1g}
+    cpus: ${API_CPUS:-1.0}
