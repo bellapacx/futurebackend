@@ -5,7 +5,10 @@ import httpx
 
 from app.providers.indicator.base import IndicatorRuntime
 
-DEFAULT_PYNE_URL = "http://127.0.0.1:5002"
+# When Pyne is mounted inside FastAPI at /pyne, the internal URL is the same
+# host/port as the FastAPI app. On Render, $PORT is injected. Locally, uvicorn
+# typically runs on 8000.
+_DEFAULT_PYNE_URL = f"http://127.0.0.1:{os.getenv('PORT', '8000')}/pyne"
 
 
 class HooxPyneRuntime(IndicatorRuntime):
@@ -15,7 +18,9 @@ class HooxPyneRuntime(IndicatorRuntime):
     """
 
     def __init__(self) -> None:
-        self.base_url = os.getenv("PYNE_API_URL", DEFAULT_PYNE_URL).rstrip("/")
+        # PYNE_API_URL overrides the default, useful for local dev where
+        # you may still run Pyne standalone on http://127.0.0.1:5002.
+        self.base_url = os.getenv("PYNE_API_URL", _DEFAULT_PYNE_URL).rstrip("/")
 
     async def execute(
         self, pine_source: str, candles: list[dict[str, Any]]

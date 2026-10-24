@@ -1,19 +1,11 @@
 services:
   - type: web
-    name: pyne-api
-    runtime: python
-    rootDir: pyne
-    buildCommand: pip install -e ".[pro]"
-    startCommand: python -m backend.app
-    envVars:
-      - key: ADMIN_TOKEN
-        generateValue: true
-
-  - type: web
-    name: futures-backend
+    name: futures-api
     runtime: python
     rootDir: backend
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install -r requirements.txt
+      cd pyne && pip install -e ".[pro]"
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
@@ -29,8 +21,3 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
-      - key: PYNE_API_URL
-        fromService:
-          name: pyne-api
-          type: web
-          property: host
