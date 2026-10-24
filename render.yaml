@@ -1,0 +1,43 @@
+cd ~/futures-charting
+cat > render.yaml <<'EOF'
+services:
+  - type: web
+    name: pyne-api
+    runtime: python
+    rootDir: pyne
+    buildCommand: pip install -e ".[pro]"
+    startCommand: python -m backend.app
+    envVars:
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+  - type: web
+    name: futures-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_JWKS_URL
+        sync: false
+      - key: DATABENTO_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: PYNE_API_URL
+        fromService:
+          name: pyne-api
+          type: web
+          property: host
+EOF
+
+git add render.yaml
+git commit -m "Add Render blueprint"
+git push origin main

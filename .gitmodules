@@ -1,0 +1,3 @@
+[submodule "pyne"]
+	path = pyne
+	url = https://github.com/hoox-sh/pyne.git
