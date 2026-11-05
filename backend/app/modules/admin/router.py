@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.auth import CurrentUser
+from app.core.auth import CurrentUser
 from app.core.admin import require_admin
 from app.core.db import get_service_client
 
