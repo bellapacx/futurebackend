@@ -6,6 +6,7 @@ import httpx
 from a2wsgi import WSGIMiddleware
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.modules.admin.router import router as admin_router
 
 from app.core.config import get_settings
 from app.core.errors import AppError, app_error_handler
@@ -104,6 +105,7 @@ def create_app() -> FastAPI:
     app.include_router(billing_router, prefix=settings.api_v1_prefix)
     app.include_router(marketdata_router, prefix=settings.api_v1_prefix)
     app.include_router(indicator_router, prefix=settings.api_v1_prefix)
+    app.include_router(admin_router, prefix=settings.api_v1_prefix)
 
     # Mount the Pyne Flask app at /pyne. All routes defined inside pyne
     # (e.g. POST /run, POST /compile/prewarm) become /pyne/run, /pyne/compile/prewarm.
