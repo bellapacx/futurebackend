@@ -8,7 +8,7 @@ from app.core.admin import (
     require_admin_write,
 )
 from app.core.auth import CurrentUser
-from app.core.db import get_service_client
+from app.core.db import get_service_client, with_db_retry
 from app.modules.admin import service
 from app.modules.admin.schemas import (
     AdminCreateRequest,
@@ -35,6 +35,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # ----------------------------------------------------------------------
 
 @router.get("/overview", response_model=OverviewResponse)
+@with_db_retry
 def overview(
     user_role: tuple[CurrentUser, AdminRole] = Depends(require_admin_read),
 ) -> OverviewResponse:
@@ -69,6 +70,7 @@ def overview(
 # ----------------------------------------------------------------------
 
 @router.get("/users", response_model=UsersListResponse)
+@with_db_retry
 def list_users(
     q: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -85,6 +87,7 @@ def list_users(
 
 
 @router.get("/users/{user_id}", response_model=UserDetailResponse)
+@with_db_retry
 def get_user(
     user_id: str,
     _=Depends(require_admin_read),
@@ -118,6 +121,7 @@ def patch_entitlement(
 # ----------------------------------------------------------------------
 
 @router.get("/entitlements", response_model=EntitlementsListResponse)
+@with_db_retry
 def list_entitlements(
     is_active: bool | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -137,6 +141,7 @@ def list_entitlements(
 # ----------------------------------------------------------------------
 
 @router.get("/indicator-versions", response_model=IndicatorVersionsListResponse)
+@with_db_retry
 def list_indicator_versions(
     _=Depends(require_admin_read),
 ) -> IndicatorVersionsListResponse:
@@ -152,6 +157,7 @@ def list_indicator_versions(
 # ----------------------------------------------------------------------
 
 @router.get("/admins", response_model=AdminsListResponse)
+@with_db_retry
 def list_admins(
     _=Depends(require_admin_owner),
 ) -> AdminsListResponse:
@@ -160,6 +166,7 @@ def list_admins(
 
 
 @router.post("/admins", response_model=AdminListItem)
+@with_db_retry
 def create_admin(
     payload: AdminCreateRequest,
     user_role: tuple[CurrentUser, AdminRole] = Depends(require_admin_owner),
@@ -178,6 +185,7 @@ def create_admin(
 
 
 @router.patch("/admins/{target_user_id}", response_model=AdminListItem)
+@with_db_retry
 def update_admin(
     target_user_id: str,
     payload: AdminUpdateRequest,
@@ -196,6 +204,7 @@ def update_admin(
 
 
 @router.delete("/admins/{target_user_id}")
+@with_db_retry
 def delete_admin(
     target_user_id: str,
     user_role: tuple[CurrentUser, AdminRole] = Depends(require_admin_owner),
@@ -213,6 +222,7 @@ def delete_admin(
 # ----------------------------------------------------------------------
 
 @router.get("/audit-log", response_model=AuditLogListResponse)
+@with_db_retry
 def get_audit_log(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
